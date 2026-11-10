@@ -72,6 +72,7 @@ final class SwitcherController {
     }
 
     func refreshPermissions() {
+        let previous = (preferences.accessibilityGranted, preferences.screenRecordingGranted, preferences.hotkeyAvailable)
         preferences.refreshPermissions()
         if preferences.accessibilityGranted && !preferences.paused {
             service.start()
@@ -81,10 +82,15 @@ final class SwitcherController {
             hotkeys.stop()
             preferences.hotkeyAvailable = false
         }
+        let current = (preferences.accessibilityGranted, preferences.screenRecordingGranted, preferences.hotkeyAvailable)
+        if previous != current {
+            Diagnostics.shared.record("permissions", ["accessibility": current.0, "screenRecording": current.1, "hotkey": current.2])
+        }
     }
 
     func showPinned(demo: Bool = false) {
         cancel()
+        NSApp.activate(ignoringOtherApps: true)
         hotkeys.preparePinnedSession()
         begin(backward: false, sameApp: false, demo: demo, pinned: true)
     }
@@ -102,6 +108,7 @@ final class SwitcherController {
     }
 
     private func begin(backward: Bool, sameApp: Bool, demo: Bool = false, pinned: Bool = false) {
+        Diagnostics.shared.record("begin", ["backward": backward, "sameApp": sameApp, "demo": demo, "pinned": pinned])
         requestID = UUID()
         let token = requestID
         session.begin(backward: backward)
@@ -123,6 +130,7 @@ final class SwitcherController {
             self.allWindows = inventory.windows
             self.session.load(inventory.windows.map(\.id), currentID: pinned ? nil : inventory.focusedID)
             self.model.loading = false
+            Diagnostics.shared.record("inventory", ["count": inventory.windows.count])
             self.updateSearch(self.model.query)
             if self.session.commitWhenReady { self.commit(); return }
             self.resizePanel()
@@ -147,21 +155,30 @@ final class SwitcherController {
         syncSelection()
     }
 
-    private func syncSelection() { model.selectedID = session.selectedID }
+    private func syncSelection() {
+        model.selectedID = session.selectedID
+        if let window = allWindows.first(where: { $0.id == session.selectedID }) {
+            Diagnostics.shared.record("selection", ["pid": window.pid, "window": window.windowID ?? 0, "minimized": window.minimized])
+        }
+    }
 
     private func commit() {
         let id = session.release()
         if session.isLoading { return }
         let window = allWindows.first { $0.id == id }
         let isDemo = model.isDemo
+        Diagnostics.shared.record("commit", ["loading": session.isLoading, "hasTarget": window != nil, "demo": isDemo])
         cancel()
         guard !isDemo, let window else { return }
         service.activate(window) { [weak self] success in
+            Diagnostics.shared.record("activation", ["success": success, "pid": window.pid, "window": window.windowID ?? 0,
+                                                      "frontmostPID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0])
             if !success { self?.preferences.statusMessage = "窗口已关闭或暂时无法切换，请重新打开切换器。" }
         }
     }
 
     func cancel() {
+        if session.isActive { Diagnostics.shared.record("cancel") }
         session.cancel()
         hotkeys.endSession()
         requestID = UUID()
@@ -187,12 +204,14 @@ final class SwitcherController {
             panel.level = .popUpMenu
             panel.hidesOnDeactivate = false
             panel.isFloatingPanel = true
+            panel.title = "瞬切 · 窗口切换器"
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
             panel.contentView = NSHostingView(rootView: SwitcherView(model: model, thumbnails: thumbnails, preferences: preferences))
             self.panel = panel
         }
         resizePanel()
         panel?.makeKeyAndOrderFront(nil)
+        Diagnostics.shared.record("panel", ["visible": panel?.isVisible == true, "width": panel?.frame.width ?? 0, "height": panel?.frame.height ?? 0])
     }
 
     private func resizePanel() {

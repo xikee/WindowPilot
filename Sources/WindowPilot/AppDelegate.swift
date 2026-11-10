@@ -12,6 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        Diagnostics.shared.record("launch")
+        setupApplicationMenu()
         if let index = CommandLine.arguments.firstIndex(of: "--verify-ui"), CommandLine.arguments.indices.contains(index + 1) {
             verification = UIVerification(directory: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
             verification?.start()
@@ -44,6 +46,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(.separator())
         addMenuItem("退出瞬切", action: #selector(quit), to: menu, key: "q")
         statusItem?.menu = menu
+    }
+
+    private func setupApplicationMenu() {
+        let menu = NSMenu()
+        let applicationItem = NSMenuItem()
+        let applicationMenu = NSMenu(title: "瞬切")
+        addMenuItem("设置…", action: #selector(showSettings), to: applicationMenu, key: ",")
+        applicationMenu.addItem(.separator())
+        addMenuItem("退出瞬切", action: #selector(quit), to: applicationMenu, key: "q")
+        applicationItem.submenu = applicationMenu
+        menu.addItem(applicationItem)
+        NSApp.mainMenu = menu
     }
 
     private func addMenuItem(_ title: String, action: Selector, to menu: NSMenu, key: String = "") {

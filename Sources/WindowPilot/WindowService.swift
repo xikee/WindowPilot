@@ -173,10 +173,12 @@ final class ThumbnailStore: ObservableObject {
     @Published private(set) var images: [String: NSImage] = [:]
     private let queue = DispatchQueue(label: "app.windowpilot.thumbnails", qos: .utility)
     private var generation = UUID()
+    private var activeCaptureID: UUID?
 
     func load(_ windows: [WindowEntry], allowed: Bool) {
         let token = UUID()
         generation = token
+        activeCaptureID = nil
         images = [:]
         guard allowed else { return }
         if #available(macOS 14.0, *) {
@@ -196,7 +198,7 @@ final class ThumbnailStore: ObservableObject {
     private func captureModern(_ windows: [WindowEntry], index: Int, available: [CGWindowID: SCWindow], token: UUID) {
         guard generation == token, index < windows.count else { return }
         let entry = windows[index]
-        guard let id = entry.windowID, let window = available[id] else {
+        guard !entry.minimized, let id = entry.windowID, let window = available[id] else {
             captureModern(windows, index: index + 1, available: available, token: token)
             return
         }
@@ -207,12 +209,23 @@ final class ThumbnailStore: ObservableObject {
         config.scalesToFit = true
         config.preservesAspectRatio = true
         let filter = SCContentFilter(desktopIndependentWindow: window)
-        SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { [weak self] image, _ in
-            DispatchQueue.main.async {
-                guard let self, self.generation == token else { return }
-                if let image { self.images[entry.id] = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height)) }
-                self.captureModern(windows, index: index + 1, available: available, token: token)
-            }
+        let captureID = UUID()
+        activeCaptureID = captureID
+        let finish: (CGImage?) -> Void = { [weak self] image in
+            guard let self, self.generation == token, self.activeCaptureID == captureID else { return }
+            self.activeCaptureID = nil
+            if let image {
+                self.images[entry.id] = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+                Diagnostics.shared.record("thumbnail", ["window": entry.windowID ?? 0, "width": image.width, "height": image.height])
+            } else { Diagnostics.shared.record("thumbnailUnavailable", ["window": entry.windowID ?? 0]) }
+            self.captureModern(windows, index: index + 1, available: available, token: token)
+        }
+        SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { image, _ in
+            DispatchQueue.main.async { finish(image) }
+        }
+        // 部分应用不返回受保护或离屏窗口的截图，不能让它们阻塞整个预览队列。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            finish(nil)
         }
     }
 
@@ -240,5 +253,5 @@ final class ThumbnailStore: ObservableObject {
         }
     }
 
-    func clear() { generation = UUID(); images = [:] }
+    func clear() { generation = UUID(); activeCaptureID = nil; images = [:] }
 }

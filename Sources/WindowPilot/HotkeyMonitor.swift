@@ -45,7 +45,8 @@ final class HotkeyMonitor {
     func endSession() { switching = false; releaseToCommit = false }
 
     func handleLocal(_ event: NSEvent) -> Bool {
-        guard tap == nil, switching || (event.type == .keyUp && !consumedKeys.isEmpty), let cgEvent = event.cgEvent else { return false }
+        // 全局钩子已消费的事件不会再到达这里；保留直接送达应用的辅助功能按键。
+        guard switching || (event.type == .keyUp && !consumedKeys.isEmpty), let cgEvent = event.cgEvent else { return false }
         return handle(type: cgEvent.type, event: cgEvent)
     }
 
