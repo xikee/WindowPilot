@@ -18,7 +18,7 @@ enum DemoWindows {
 struct AppIcon: View {
     let window: WindowEntry
     var size: CGFloat = 26
-    private var image: NSImage? { window.pid > 0 ? NSRunningApplication(processIdentifier: window.pid)?.icon : nil }
+    private var image: NSImage? { window.icon }
     private var colors: [Color] { [.blue, Color(hex: 0x419BD7), Color(hex: 0xC08AF4), .yellow, .blue, Color(hex: 0xEE6776)] }
     private var symbols: [String] { ["safari.fill", "chevron.left.forwardslash.chevron.right", "square.stack.3d.up.fill", "note.text", "folder.fill", "music.note"] }
     var body: some View {

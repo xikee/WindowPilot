@@ -1,6 +1,6 @@
 import AppKit
 import ApplicationServices
-import ScreenCaptureKit
+import SwitchCore
 
 struct WindowEntry: Identifiable {
     let id: String
@@ -10,14 +10,17 @@ struct WindowEntry: Identifiable {
     let title: String
     let bounds: CGRect
     let minimized: Bool
-    let hidden: Bool
+    var hidden: Bool
     let element: AXUIElement?
+    var icon: NSImage? = nil
     var demoStyle: Int? = nil
 }
 
 struct WindowInventory {
     let windows: [WindowEntry]
     let focusedID: String?
+    var cached = false
+    var focusSource = "none"
 }
 
 private func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
@@ -27,9 +30,10 @@ private func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
 
 private func elementID(_ element: AXUIElement, pid: pid_t) -> String { "\(pid):\(CFHash(element))" }
 
-private func frame(of element: AXUIElement) -> CGRect? {
-    guard let position = attribute(element, kAXPositionAttribute), CFGetTypeID(position) == AXValueGetTypeID(),
-          let size = attribute(element, kAXSizeAttribute), CFGetTypeID(size) == AXValueGetTypeID() else { return nil }
+private func frame(position: Any, size: Any) -> CGRect? {
+    let position = position as CFTypeRef
+    let size = size as CFTypeRef
+    guard CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID() else { return nil }
     var point = CGPoint.zero
     var dimensions = CGSize.zero
     guard AXValueGetValue(unsafeBitCast(position, to: AXValue.self), .cgPoint, &point),
@@ -38,220 +42,372 @@ private func frame(of element: AXUIElement) -> CGRect? {
 }
 
 final class WindowService {
-    private let queue = DispatchQueue(label: "app.windowpilot.accessibility", qos: .userInitiated)
-    private var observers: [pid_t: AXObserver] = [:]
+    private struct AppInfo {
+        let pid: pid_t
+        let name: String
+        let hidden: Bool
+        let icon: NSImage?
+    }
+
+    private struct Catalog {
+        let windows: [WindowEntry]
+        let pids: Set<pid_t>
+    }
+
+    private struct CGWindow {
+        let id: CGWindowID
+        let bounds: CGRect
+        let title: String?
+        let rank: Int
+    }
+
+    private enum FrontWindow {
+        case accessibility(String)
+        case windowServer(CGWindowID)
+        case unknown
+    }
+
+    // 状态归主线程所有。目录刷新、焦点查询与切换分别排队，避免慢应用阻塞选中的窗口。
+    private let catalogQueue = DispatchQueue(label: "app.windowpilot.catalog", qos: .utility)
+    private let observerQueue = DispatchQueue(label: "app.windowpilot.observers", qos: .utility)
+    private let focusQueue = DispatchQueue(label: "app.windowpilot.focus", qos: .userInitiated)
+    private let shortcutFocusQueue = DispatchQueue(label: "app.windowpilot.shortcut-focus", qos: .userInitiated, attributes: .concurrent)
+    private let activationQueue = DispatchQueue(label: "app.windowpilot.activation", qos: .userInteractive)
+    private var catalog: Catalog?
+    private var catalogEpoch = 0
+    private var lifecycleEpoch = 0
+    private var refreshing = false
+    private var refreshAgain = false
+    private var waiters: [(Catalog) -> Void] = []
+    private var focusPending: pid_t?
+    private var readingFocus = false
+    private var focusRevision = 0
     private var recent: [String] = []
+    private var apps: [pid_t: AppInfo] = [:]
+    private var observers: [pid_t: AXObserver] = [:]
+    private var observerRequests = Set<pid_t>()
     private var workspaceTokens: [NSObjectProtocol] = []
+    private var refreshTimer: Timer?
     private var started = false
 
     func start() {
         guard !started, AXIsProcessTrusted() else { return }
         started = true
-        updateObservers()
+        lifecycleEpoch &+= 1
         let center = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+        workspaceTokens.append(center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.noteFocus()
+        })
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
+                     NSWorkspace.didHideApplicationNotification, NSWorkspace.didUnhideApplicationNotification] {
             workspaceTokens.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                self?.updateObservers()
-                self?.noteFocus()
+                self?.refresh(followUp: true)
             })
         }
+        workspaceTokens.append(center.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.catalogEpoch &+= 1
+            self.catalog = nil
+            self.noteFocus()
+            self.refresh(followUp: true)
+        })
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        timer.tolerance = 0.4
+        RunLoop.main.add(timer, forMode: .common)
+        refreshTimer = timer
         noteFocus()
+        refresh(followUp: true)
     }
 
-    private func updateObservers() {
-        let apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular && $0.processIdentifier != getpid() }
-        let livePIDs = Set(apps.map(\.processIdentifier))
-        for pid in Array(observers.keys) where !livePIDs.contains(pid) {
+    func stop() {
+        guard started else { return }
+        started = false
+        lifecycleEpoch &+= 1
+        catalogEpoch &+= 1
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        for token in workspaceTokens { NSWorkspace.shared.notificationCenter.removeObserver(token) }
+        workspaceTokens.removeAll()
+        for observer in observers.values { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes) }
+        observers.removeAll()
+        observerRequests.removeAll()
+        catalog = nil
+        waiters.removeAll()
+        focusPending = nil
+        recent.removeAll()
+        apps.removeAll()
+    }
+
+    private func runningApps() -> [NSRunningApplication] {
+        NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular && $0.processIdentifier != getpid() }
+    }
+
+    private func refresh(followUp: Bool = false) {
+        guard started else { return }
+        if refreshing { refreshAgain = refreshAgain || followUp; return }
+        refreshing = true
+        refreshAgain = false
+        let epoch = catalogEpoch
+        let previous = catalog?.windows ?? []
+        let currentApps = runningApps()
+        let oldApps = apps
+        apps = Dictionary(uniqueKeysWithValues: currentApps.map { app in
+            let pid = app.processIdentifier
+            let info = AppInfo(pid: pid, name: oldApps[pid]?.name ?? app.localizedName ?? "应用",
+                               hidden: app.isHidden, icon: oldApps[pid]?.icon ?? app.icon)
+            return (pid, info)
+        })
+        let appInfos = currentApps.compactMap { apps[$0.processIdentifier] }
+        let pids = Set(apps.keys)
+        syncObservers(pids)
+        catalogQueue.async { [weak self] in
+            let result = Self.scan(appInfos, previous: previous)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.refreshing = false
+                if self.started, self.catalogEpoch == epoch {
+                    self.catalog = Catalog(windows: result, pids: pids)
+                    let callbacks = self.waiters
+                    self.waiters.removeAll()
+                    if let catalog = self.catalog { callbacks.forEach { $0(catalog) } }
+                }
+                if self.refreshAgain { self.refresh() }
+            }
+        }
+    }
+
+    private func syncObservers(_ pids: Set<pid_t>) {
+        for pid in observerRequests.subtracting(pids) {
             if let observer = observers.removeValue(forKey: pid) {
                 CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
             }
         }
-        for app in apps where observers[app.processIdentifier] == nil {
-            var observer: AXObserver?
-            let result = AXObserverCreate(app.processIdentifier, { _, _, _, context in
-                guard let context else { return }
-                Unmanaged<WindowService>.fromOpaque(context).takeUnretainedValue().noteFocus()
-            }, &observer)
-            guard result == .success, let observer else { continue }
-            let element = AXUIElementCreateApplication(app.processIdentifier)
-            AXUIElementSetMessagingTimeout(element, 0.15)
-            AXObserverAddNotification(observer, element, kAXFocusedWindowChangedNotification as CFString, Unmanaged.passUnretained(self).toOpaque())
-            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
-            observers[app.processIdentifier] = observer
+        observerRequests.formIntersection(pids)
+        let newPIDs = pids.subtracting(observerRequests)
+        observerRequests.formUnion(newPIDs)
+        let epoch = lifecycleEpoch
+        for pid in newPIDs {
+            observerQueue.async { [weak self] in
+                guard let self else { return }
+                var observer: AXObserver?
+                let result = AXObserverCreate(pid, { _, _, notification, context in
+                    guard let context else { return }
+                    let service = Unmanaged<WindowService>.fromOpaque(context).takeUnretainedValue()
+                    if notification as String == kAXFocusedWindowChangedNotification { service.noteFocus() }
+                    else { service.refresh(followUp: true) }
+                }, &observer)
+                guard result == .success, let observer else { return }
+                let element = AXUIElementCreateApplication(pid)
+                AXUIElementSetMessagingTimeout(element, 0.10)
+                for notification in [kAXFocusedWindowChangedNotification, kAXWindowCreatedNotification,
+                                     kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification] {
+                    AXObserverAddNotification(observer, element, notification as CFString, Unmanaged.passUnretained(self).toOpaque())
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.lifecycleEpoch == epoch, self.observerRequests.contains(pid) else { return }
+                    self.observers[pid] = observer
+                    CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+                }
+            }
         }
     }
 
     private func noteFocus() {
-        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier, pid != getpid() else { return }
-        queue.async { [weak self] in
-            let app = AXUIElementCreateApplication(pid)
-            AXUIElementSetMessagingTimeout(app, 0.15)
-            guard let value = attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() else { return }
-            let id = elementID(unsafeBitCast(value, to: AXUIElement.self), pid: pid)
-            self?.markRecent(id)
+        guard started, let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier, pid != getpid() else { return }
+        focusRevision &+= 1
+        focusPending = pid
+        readFocus()
+    }
+
+    private func readFocus() {
+        guard !readingFocus, let pid = focusPending else { return }
+        readingFocus = true
+        focusPending = nil
+        let revision = focusRevision
+        let epoch = lifecycleEpoch
+        focusQueue.async { [weak self] in
+            let id = Self.focusedWindowID(pid: pid, timeout: 0.10)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.readingFocus = false
+                if self.lifecycleEpoch == epoch, self.focusRevision == revision,
+                   NSWorkspace.shared.frontmostApplication?.processIdentifier == pid, let id {
+                    self.remember(id)
+                    if self.catalog?.windows.contains(where: { $0.id == id }) == false { self.refresh(followUp: true) }
+                }
+                self.readFocus()
+            }
         }
     }
 
-    private func markRecent(_ id: String) {
+    private func remember(_ id: String) {
         recent.removeAll { $0 == id }
         recent.insert(id, at: 0)
-        if recent.count > 300 { recent = Array(recent.prefix(300)) }
+        if recent.count > 300 { recent.removeLast() }
     }
 
-    func discover(includeMinimized: Bool, onlyPID: pid_t?, screen: CGRect?, completion: @escaping (WindowInventory) -> Void) {
-        let apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular && $0.processIdentifier != getpid() }
-            .map { (pid: $0.processIdentifier, name: $0.localizedName ?? "应用", hidden: $0.isHidden) }
-        let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        queue.async { [weak self] in
-            guard let self else { return }
-            let descriptions = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-            let cgWindows = descriptions.filter { ($0[kCGWindowLayer as String] as? Int) == 0 }
-            var entries: [(window: WindowEntry, rank: Int)] = []
-            var focusedID: String?
-            for app in apps where onlyPID == nil || onlyPID == app.pid {
-                let element = AXUIElementCreateApplication(app.pid)
-                AXUIElementSetMessagingTimeout(element, 0.15)
-                if app.pid == frontPID, let focus = attribute(element, kAXFocusedWindowAttribute), CFGetTypeID(focus) == AXUIElementGetTypeID() {
-                    focusedID = elementID(unsafeBitCast(focus, to: AXUIElement.self), pid: app.pid)
-                }
-                guard let windows = attribute(element, kAXWindowsAttribute) as? [AXUIElement] else { continue }
-                var matchedIDs = Set<CGWindowID>()
-                for window in windows {
-                    guard let bounds = frame(of: window), bounds.width > 80, bounds.height > 50 else { continue }
-                    let subrole = attribute(window, kAXSubroleAttribute) as? String ?? ""
-                    guard subrole == kAXStandardWindowSubrole || subrole == kAXDialogSubrole || subrole.isEmpty else { continue }
-                    let minimized = attribute(window, kAXMinimizedAttribute) as? Bool ?? false
-                    guard includeMinimized || !minimized else { continue }
-                    if let screen, !screen.intersects(bounds) { continue }
-                    let title = attribute(window, kAXTitleAttribute) as? String ?? ""
-                    let match = cgWindows.enumerated().compactMap { index, info -> (index: Int, id: CGWindowID, score: CGFloat)? in
-                        guard info[kCGWindowOwnerPID as String] as? pid_t == app.pid,
-                              let number = info[kCGWindowNumber as String] as? UInt32, !matchedIDs.contains(number),
-                              let dictionary = info[kCGWindowBounds as String] as? NSDictionary,
-                              let rect = CGRect(dictionaryRepresentation: dictionary) else { return nil }
-                        let delta = abs(rect.minX - bounds.minX) + abs(rect.minY - bounds.minY) + abs(rect.width - bounds.width) + abs(rect.height - bounds.height)
-                        let sameTitle = !title.isEmpty && info[kCGWindowName as String] as? String == title
-                        guard delta < 8 || sameTitle else { return nil }
-                        return (index, number, delta + (sameTitle ? 0 : 100))
-                    }.min { $0.score < $1.score }
-                    if let match { matchedIDs.insert(match.id) }
-                    let entry = WindowEntry(id: elementID(window, pid: app.pid), windowID: match?.id, pid: app.pid, appName: app.name,
-                                            title: title.isEmpty ? app.name : title, bounds: bounds, minimized: minimized, hidden: app.hidden, element: window)
-                    entries.append((entry, match?.index ?? 10_000))
-                }
-            }
-            if let focusedID { self.markRecent(focusedID) }
-            let ranks = Dictionary(uniqueKeysWithValues: self.recent.enumerated().map { ($0.element, $0.offset) })
-            entries.sort {
-                let lhs = ranks[$0.window.id] ?? 1000 + $0.rank
-                let rhs = ranks[$1.window.id] ?? 1000 + $1.rank
-                if lhs != rhs { return lhs < rhs }
-                return $0.window.id < $1.window.id
-            }
-            let inventory = WindowInventory(windows: entries.map(\.window), focusedID: focusedID)
-            DispatchQueue.main.async { completion(inventory) }
+    private static func focusedWindowID(pid: pid_t, timeout: Float) -> String? {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, timeout)
+        guard let value = attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return elementID(unsafeBitCast(value, to: AXUIElement.self), pid: pid)
+    }
+
+    private static func frontWindow(pid: pid_t) -> FrontWindow {
+        if let id = focusedWindowID(pid: pid, timeout: 0.06) { return .accessibility(id) }
+        // 前台应用暂时不回答时，用窗口服务器的实时顺序，避免把旧焦点当成当前窗口。
+        let descriptions = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for info in descriptions where info[kCGWindowOwnerPID as String] as? pid_t == pid && info[kCGWindowLayer as String] as? Int == 0 {
+            guard let dictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: dictionary), bounds.width > 80, bounds.height > 50,
+                  let id = info[kCGWindowNumber as String] as? CGWindowID else { continue }
+            return .windowServer(id)
         }
+        return .unknown
+    }
+
+    func discover(includeMinimized: Bool, sameApp: Bool, screen: CGRect?, resolveFrontWindow: Bool,
+                  completion: @escaping (WindowInventory) -> Void) {
+        let frontPID = resolveFrontWindow ? NSWorkspace.shared.frontmostApplication?.processIdentifier : nil
+        let onlyPID = sameApp ? frontPID : nil
+        let deliver: (Catalog, Bool, FrontWindow) -> Void = { [weak self] catalog, cached, focus in
+            guard let self else { return }
+            let live = Dictionary(uniqueKeysWithValues: self.runningApps().map { ($0.processIdentifier, $0.isHidden) })
+            let windows = catalog.windows.compactMap { window -> WindowEntry? in
+                guard let hidden = live[window.pid], onlyPID == nil || window.pid == onlyPID,
+                      includeMinimized || !window.minimized, screen?.intersects(window.bounds) != false else { return nil }
+                var window = window
+                window.hidden = hidden
+                return window
+            }
+            let current: String?
+            let source: String
+            switch focus {
+            case let .accessibility(id):
+                current = id
+                source = "accessibility"
+            case let .windowServer(id):
+                current = windows.first(where: { $0.pid == frontPID && $0.windowID == id })?.id
+                source = "windowServer"
+            case .unknown:
+                current = nil
+                source = "none"
+            }
+            let ordered = WindowOrder.byRecency(windows, id: \.id, focusedID: current, recent: self.recent)
+            completion(WindowInventory(windows: ordered, focusedID: current, cached: cached, focusSource: source))
+        }
+        let resolve: (Catalog, Bool) -> Void = { [weak self] catalog, cached in
+            guard let self else { return }
+            guard let pid = frontPID, pid != getpid() else { deliver(catalog, cached, .unknown); return }
+            let epoch = self.catalogEpoch
+            self.shortcutFocusQueue.async { [weak self] in
+                let focus = Self.frontWindow(pid: pid)
+                DispatchQueue.main.async {
+                    guard let self, self.started, self.catalogEpoch == epoch else { return }
+                    deliver(self.catalog ?? catalog, cached, focus)
+                }
+            }
+        }
+        if let catalog, onlyPID.map(catalog.pids.contains) != false {
+            resolve(catalog, true)
+        } else if started {
+            waiters.append { resolve($0, false) }
+            refresh()
+        } else {
+            completion(WindowInventory(windows: [], focusedID: nil))
+        }
+    }
+
+    private static func scan(_ apps: [AppInfo], previous: [WindowEntry]) -> [WindowEntry] {
+        let descriptions = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        var candidates: [pid_t: [CGWindow]] = [:]
+        for (rank, info) in descriptions.enumerated() {
+            guard info[kCGWindowLayer as String] as? Int == 0,
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                  let id = info[kCGWindowNumber as String] as? CGWindowID,
+                  let dictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: dictionary) else { continue }
+            candidates[pid, default: []].append(CGWindow(id: id, bounds: bounds, title: info[kCGWindowName as String] as? String, rank: rank))
+        }
+        let previousByPID = Dictionary(grouping: previous, by: \.pid)
+        var entries: [(WindowEntry, Int)] = []
+        let names = [kAXPositionAttribute, kAXSizeAttribute, kAXSubroleAttribute, kAXMinimizedAttribute, kAXTitleAttribute] as CFArray
+        for app in apps {
+            let element = AXUIElementCreateApplication(app.pid)
+            AXUIElementSetMessagingTimeout(element, 0.12)
+            var value: CFTypeRef?
+            let result = AXUIElementCopyAttributeValue(element, kAXWindowsAttribute as CFString, &value)
+            let matching = candidates[app.pid] ?? []
+            if result == .cannotComplete {
+                entries += (previousByPID[app.pid] ?? []).map { entry in (entry, matching.first(where: { $0.id == entry.windowID })?.rank ?? Int.max) }
+                continue
+            }
+            guard result == .success, let windows = value as? [AXUIElement] else { continue }
+            var matched = Set<CGWindowID>()
+            for window in windows {
+                AXUIElementSetMessagingTimeout(window, 0.12)
+                var values: CFArray?
+                let result = AXUIElementCopyMultipleAttributeValues(window, names, [], &values)
+                let id = elementID(window, pid: app.pid)
+                if result == .cannotComplete, let old = previousByPID[app.pid]?.first(where: { $0.id == id }) {
+                    entries.append((old, matching.first(where: { $0.id == old.windowID })?.rank ?? Int.max))
+                    if let oldID = old.windowID { matched.insert(oldID) }
+                    continue
+                }
+                guard result == .success, let attributes = values as? [Any], attributes.count == 5,
+                      let bounds = frame(position: attributes[0], size: attributes[1]), bounds.width > 80, bounds.height > 50 else { continue }
+                let subrole = attributes[2] as? String ?? ""
+                guard subrole == kAXStandardWindowSubrole || subrole == kAXDialogSubrole || subrole.isEmpty else { continue }
+                let minimized = attributes[3] as? Bool ?? false
+                let title = attributes[4] as? String ?? ""
+                let match = matching.lazy.filter { !matched.contains($0.id) }.compactMap { candidate -> (CGWindow, CGFloat)? in
+                    let rect = candidate.bounds
+                    let delta = abs(rect.minX - bounds.minX) + abs(rect.minY - bounds.minY) + abs(rect.width - bounds.width) + abs(rect.height - bounds.height)
+                    let sameTitle = !title.isEmpty && candidate.title == title
+                    return delta < 8 || sameTitle ? (candidate, delta + (sameTitle ? 0 : 100)) : nil
+                }.min { $0.1 < $1.1 }?.0
+                if let match { matched.insert(match.id) }
+                let entry = WindowEntry(id: id, windowID: match?.id, pid: app.pid, appName: app.name,
+                                        title: title.isEmpty ? app.name : title, bounds: bounds, minimized: minimized,
+                                        hidden: app.hidden, element: window, icon: app.icon)
+                entries.append((entry, match?.rank ?? Int.max))
+            }
+        }
+        return entries.sorted { lhs, rhs in lhs.1 == rhs.1 ? lhs.0.id < rhs.0.id : lhs.1 < rhs.1 }.map(\.0)
     }
 
     func activate(_ window: WindowEntry, completion: @escaping (Bool) -> Void) {
-        guard let element = window.element else { completion(false); return }
-        // 在主线程激活应用，在串行队列调用可能阻塞的辅助功能 API。
-        let app = NSRunningApplication(processIdentifier: window.pid)
-        app?.unhide()
-        app?.activate(options: [])
-        queue.async { [weak self] in
-            if window.minimized { AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, kCFBooleanFalse) }
-            let result = AXUIElementPerformAction(element, kAXRaiseAction as CFString)
-            AXUIElementSetAttributeValue(AXUIElementCreateApplication(window.pid), kAXFocusedWindowAttribute as CFString, element)
-            if result == .success { self?.markRecent(window.id) }
-            DispatchQueue.main.async { completion(result == .success) }
-        }
-    }
-}
-
-final class ThumbnailStore: ObservableObject {
-    @Published private(set) var images: [String: NSImage] = [:]
-    private let queue = DispatchQueue(label: "app.windowpilot.thumbnails", qos: .utility)
-    private var generation = UUID()
-    private var activeCaptureID: UUID?
-
-    func load(_ windows: [WindowEntry], allowed: Bool) {
-        let token = UUID()
-        generation = token
-        activeCaptureID = nil
-        images = [:]
-        guard allowed else { return }
-        if #available(macOS 14.0, *) {
-            SCShareableContent.getExcludingDesktopWindows(true, onScreenWindowsOnly: false) { [weak self] content, _ in
-                DispatchQueue.main.async {
-                    guard let self, self.generation == token, let content else { return }
-                    let available = Dictionary(uniqueKeysWithValues: content.windows.map { ($0.windowID, $0) })
-                    self.captureModern(windows, index: 0, available: available, token: token)
-                }
-            }
-        } else {
-            loadLegacy(windows, token: token)
-        }
-    }
-
-    @available(macOS 14.0, *)
-    private func captureModern(_ windows: [WindowEntry], index: Int, available: [CGWindowID: SCWindow], token: UUID) {
-        guard generation == token, index < windows.count else { return }
-        let entry = windows[index]
-        guard !entry.minimized, let id = entry.windowID, let window = available[id] else {
-            captureModern(windows, index: index + 1, available: available, token: token)
+        guard let element = window.element, let app = NSRunningApplication(processIdentifier: window.pid), !app.isTerminated else {
+            completion(false)
             return
         }
-        let config = SCStreamConfiguration()
-        config.width = 640
-        config.height = max(1, min(1280, Int(640 * window.frame.height / max(1, window.frame.width))))
-        config.showsCursor = false
-        config.scalesToFit = true
-        config.preservesAspectRatio = true
-        let filter = SCContentFilter(desktopIndependentWindow: window)
-        let captureID = UUID()
-        activeCaptureID = captureID
-        let finish: (CGImage?) -> Void = { [weak self] image in
-            guard let self, self.generation == token, self.activeCaptureID == captureID else { return }
-            self.activeCaptureID = nil
-            if let image {
-                self.images[entry.id] = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
-                Diagnostics.shared.record("thumbnail", ["window": entry.windowID ?? 0, "width": image.width, "height": image.height])
-            } else { Diagnostics.shared.record("thumbnailUnavailable", ["window": entry.windowID ?? 0]) }
-            self.captureModern(windows, index: index + 1, available: available, token: token)
-        }
-        SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) { image, _ in
-            DispatchQueue.main.async { finish(image) }
-        }
-        // 部分应用不返回受保护或离屏窗口的截图，不能让它们阻塞整个预览队列。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-            finish(nil)
-        }
-    }
-
-    @available(macOS, introduced: 13.0, obsoleted: 14.0)
-    private func loadLegacy(_ windows: [WindowEntry], token: UUID) {
-        queue.async { [weak self] in
-            for window in windows {
-                let valid = DispatchQueue.main.sync { self?.generation == token }
-                guard valid else { return }
-                guard let id = window.windowID,
-                      let image = CGWindowListCreateImage(.null, .optionIncludingWindow, id, [.boundsIgnoreFraming, .bestResolution]) else { continue }
-                // 缓存缩略尺寸，避免为每个窗口保留完整分辨率的图像。
-                let width = min(640, image.width)
-                let height = max(1, Int(Double(image.height) * Double(width) / Double(image.width)))
-                guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
-                                              space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { continue }
-                context.interpolationQuality = .medium
-                context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-                guard let thumbnail = context.makeImage() else { continue }
-                DispatchQueue.main.async {
-                    guard let self, self.generation == token else { return }
-                    self.images[window.id] = NSImage(cgImage: thumbnail, size: NSSize(width: width, height: height))
+        if app.isHidden { app.unhide() }
+        if !app.isActive { app.activate(options: []) }
+        activationQueue.async { [weak self] in
+            // 只核对目标窗口的实时最小化状态；后台快照可能刚好早于最小化操作。
+            if attribute(element, kAXMinimizedAttribute) as? Bool ?? window.minimized {
+                AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+            }
+            let result = AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+            let success: Bool
+            if result == .success {
+                success = true
+            } else {
+                let application = AXUIElementCreateApplication(window.pid)
+                AXUIElementSetMessagingTimeout(application, 0.12)
+                success = AXUIElementSetAttributeValue(application, kAXFocusedWindowAttribute as CFString, element) == .success
+            }
+            DispatchQueue.main.async {
+                if success {
+                    self?.remember(window.id)
+                } else if let self {
+                    if let catalog = self.catalog {
+                        self.catalog = Catalog(windows: catalog.windows.filter { $0.id != window.id }, pids: catalog.pids)
+                    }
+                    self.refresh(followUp: true)
                 }
+                completion(success)
             }
         }
     }
-
-    func clear() { generation = UUID(); activeCaptureID = nil; images = [:] }
 }

@@ -104,8 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         permissionTimer?.invalidate()
-        switcher.cancel()
-        switcher.hotkeys.stop()
+        switcher.shutdown()
     }
 
     private func renderPreview() {

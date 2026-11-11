@@ -39,8 +39,10 @@ final class Preferences: ObservableObject {
     }
 
     func refreshPermissions() {
-        accessibilityGranted = AXIsProcessTrusted()
-        screenRecordingGranted = CGPreflightScreenCaptureAccess()
+        let accessibility = AXIsProcessTrusted()
+        let recording = CGPreflightScreenCaptureAccess()
+        if accessibilityGranted != accessibility { accessibilityGranted = accessibility }
+        if screenRecordingGranted != recording { screenRecordingGranted = recording }
     }
 
     func openAccessibilitySettings() {

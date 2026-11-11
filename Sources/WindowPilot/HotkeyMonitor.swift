@@ -15,7 +15,10 @@ final class HotkeyMonitor {
     private var consumedKeys = Set<Int64>()
 
     @discardableResult func start() -> Bool {
-        if let tap { CGEvent.tapEnable(tap: tap, enable: true); return true }
+        if let tap {
+            if !CGEvent.tapIsEnabled(tap: tap) { CGEvent.tapEnable(tap: tap, enable: true) }
+            return true
+        }
         guard AXIsProcessTrusted() else { return false }
         let mask = [CGEventType.keyDown, .keyUp, .flagsChanged].reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
         tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
@@ -50,9 +53,11 @@ final class HotkeyMonitor {
         return handle(type: cgEvent.type, event: cgEvent)
     }
 
-    private func handle(type: CGEventType, event: CGEvent) -> Bool {
+    func handle(type: CGEventType, event: CGEvent) -> Bool {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            consumedKeys.removeAll()
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            Diagnostics.shared.record("shortcutTapResumed", ["timedOut": type == .tapDisabledByTimeout])
             if switching { endSession(); onAction?(.cancel) }
             return false
         }
@@ -66,11 +71,15 @@ final class HotkeyMonitor {
             return false
         }
         guard type == .keyDown else { return false }
-        if !switching && consumedKeys.contains(code) { return true }
+        let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+        // 新的物理按下应覆盖可能遗漏的抬起事件；仅吞掉旧按键的系统连发。
+        if isRepeat && consumedKeys.contains(code) && (!switching || code == 48 || code == 50) { return true }
+        if !isRepeat { consumedKeys.remove(code) }
         let flags = event.flags
         let otherModifiers: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate]
         let onlyChosenModifier = flags.intersection(otherModifiers) == modifier.flag
         if (code == 48 || code == 50) && onlyChosenModifier {
+            if isRepeat { consumedKeys.insert(code); return true }
             if switching {
                 onAction?(.move(flags.contains(.maskShift) ? -1 : 1))
             } else {

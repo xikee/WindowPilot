@@ -5,7 +5,6 @@ struct WindowCard: View {
     let selected: Bool
     var thumbnail: NSImage? = nil
     var compact = false
-    var index = 0
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if !compact {
@@ -14,7 +13,10 @@ struct WindowCard: View {
                     if let style = window.demoStyle { DemoPreview(style: style) }
                     else if let thumbnail { Image(nsImage: thumbnail).resizable().scaledToFit() }
                     else {
-                        VStack(spacing: 9) { AppIcon(window: window, size: 38); Text(window.minimized ? "已最小化" : "窗口预览不可用").font(.system(size: 10)).foregroundStyle(Palette.secondary) }
+                        VStack(spacing: 9) {
+                            AppIcon(window: window, size: 38)
+                            if window.minimized { Text("已最小化").font(.system(size: 10)).foregroundStyle(Palette.secondary) }
+                        }
                     }
                 }.aspectRatio(5 / 3, contentMode: .fit).clipped()
             }
@@ -47,6 +49,8 @@ struct SwitcherView: View {
     @ObservedObject var preferences: Preferences
 
     var body: some View {
+        let presentationID = model.presentationID
+        let selectedID = model.selectedID
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 BrandMark(size: 26)
@@ -73,14 +77,18 @@ struct SwitcherView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
-                            ForEach(Array(model.windows.enumerated()), id: \.element.id) { index, window in
+                            ForEach(model.windows) { window in
                                 Button { model.choose?(window.id) } label: {
-                                    WindowCard(window: window, selected: model.selectedID == window.id, thumbnail: thumbnails.images[window.id], compact: preferences.compact, index: index)
+                                    WindowCard(window: window, selected: selectedID == window.id, thumbnail: thumbnails.images[window.id], compact: preferences.compact)
                                 }.buttonStyle(.plain).id(window.id)
+                                    .onAppear { thumbnails.request(window, presentation: presentationID) }
+                                    .onDisappear { thumbnails.remove(window.id, presentation: presentationID) }
                             }
                         }.padding(.horizontal, 24).padding(.bottom, 6)
-                    }.onReceive(model.$selectedID) { id in if let id { proxy.scrollTo(id) } }
-                }
+                    }
+                    .onAppear { if let selectedID { proxy.scrollTo(selectedID) } }
+                    .onChange(of: selectedID) { id in if let id { proxy.scrollTo(id) } }
+                }.id(presentationID)
             }
             HStack(spacing: 6) {
                 KeyCap(text: "tab"); Text("下一个").padding(.trailing, 9)

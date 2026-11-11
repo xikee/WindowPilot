@@ -17,7 +17,7 @@ xcrun swiftc -target "$TARGET" "$OPTIMIZATION" -parse-as-library -emit-library -
     -emit-module-path "$BIN_DIR/SwitchCore.swiftmodule" -o "$BIN_DIR/libSwitchCore.a"
 xcrun swiftc -target "$TARGET" "$OPTIMIZATION" -I "$BIN_DIR" -L "$BIN_DIR" -lSwitchCore \
     "$PROJECT_DIR"/Sources/WindowPilot/*.swift -o "$BIN_DIR/WindowPilot"
-APP_DIR="$PROJECT_DIR/dist/瞬切.app"
+APP_DIR="${WINDOWPILOT_APP_DIR:-$PROJECT_DIR/dist/瞬切.app}"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_DIR/WindowPilot" "$APP_DIR/Contents/MacOS/WindowPilot"
 cp "$PROJECT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"

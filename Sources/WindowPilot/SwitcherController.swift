@@ -10,6 +10,7 @@ final class SwitcherModel: ObservableObject {
     @Published var loading = false
     @Published var isDemo = false
     @Published var sameApp = false
+    @Published var presentationID = UUID()
     var choose: ((String) -> Void)?
     var cancel: (() -> Void)?
     var clearSearch: (() -> Void)?
@@ -25,6 +26,7 @@ final class SwitcherController {
     let thumbnails = ThumbnailStore()
     let hotkeys = HotkeyMonitor()
     private let preferences: Preferences
+    private let useDemoWindowsForShortcuts: Bool
     private let service = WindowService()
     private var session = SwitchSession()
     private var allWindows: [WindowEntry] = []
@@ -38,8 +40,9 @@ final class SwitcherController {
     private var lastScreen = CGRect.zero
     var presentationView: NSView? { panel?.contentView }
 
-    init(preferences: Preferences) {
+    init(preferences: Preferences, useDemoWindowsForShortcuts: Bool = false) {
         self.preferences = preferences
+        self.useDemoWindowsForShortcuts = useDemoWindowsForShortcuts
         hotkeys.onAction = { [weak self] in self?.handle($0) }
         model.choose = { [weak self] id in self?.session.select(id); self?.commit() }
         model.cancel = { [weak self] in self?.cancel() }
@@ -51,14 +54,13 @@ final class SwitcherController {
             if paused { self.hotkeys.stop(); preferences.hotkeyAvailable = false }
             else { DispatchQueue.main.async { self.refreshPermissions() } }
         }.store(in: &cancellables)
-        preferences.$showThumbnails.dropFirst().removeDuplicates().sink { [weak self] enabled in
-            guard let self else { return }
-            if !enabled { self.thumbnails.clear() }
-            else if self.session.isActive { self.thumbnails.load(self.allWindows, allowed: preferences.screenRecordingGranted && !self.model.isDemo) }
-        }.store(in: &cancellables)
-        preferences.$screenRecordingGranted.removeDuplicates().sink { [weak self] granted in
-            if !granted { self?.thumbnails.clear() }
-        }.store(in: &cancellables)
+        Publishers.CombineLatest3(preferences.$showThumbnails, preferences.$screenRecordingGranted, preferences.$compact)
+            .map { $0 && $1 && !$2 }.removeDuplicates().sink { [weak self] enabled in
+                guard let self, self.session.isActive, !self.model.isDemo else { return }
+                self.thumbnails.setEnabled(enabled)
+            }.store(in: &cancellables)
+        // 界面验证直接调用按键处理器，不接收桌面上无关的鼠标、键盘或 Space 事件。
+        guard !useDemoWindowsForShortcuts else { return }
         mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.dismissIfOutside() }
         localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
             self?.dismissIfOutside()
@@ -74,14 +76,15 @@ final class SwitcherController {
     func refreshPermissions() {
         let previous = (preferences.accessibilityGranted, preferences.screenRecordingGranted, preferences.hotkeyAvailable)
         preferences.refreshPermissions()
-        if preferences.accessibilityGranted && !preferences.paused {
-            service.start()
-            preferences.hotkeyAvailable = hotkeys.start()
-        } else {
+        if preferences.accessibilityGranted { service.start() }
+        else {
             if session.isActive && !model.isDemo { cancel() }
-            hotkeys.stop()
-            preferences.hotkeyAvailable = false
+            service.stop()
         }
+        let hotkeyReady = preferences.accessibilityGranted && !preferences.paused && hotkeys.start()
+        if !hotkeyReady && previous.2 { hotkeys.stop() }
+        if preferences.hotkeyAvailable != hotkeyReady { preferences.hotkeyAvailable = hotkeyReady }
+        if hotkeyReady && panel == nil { DispatchQueue.main.async { [weak self] in self?.preparePanel() } }
         let current = (preferences.accessibilityGranted, preferences.screenRecordingGranted, preferences.hotkeyAvailable)
         if previous != current {
             Diagnostics.shared.record("permissions", ["accessibility": current.0, "screenRecording": current.1, "hotkey": current.2])
@@ -97,9 +100,11 @@ final class SwitcherController {
 
     private func handle(_ action: SwitchAction) {
         switch action {
-        case let .begin(backward, sameApp): begin(backward: backward, sameApp: sameApp)
+        case let .begin(backward, sameApp): begin(backward: backward, sameApp: sameApp, demo: useDemoWindowsForShortcuts)
         case let .move(steps): session.move(steps); syncSelection()
-        case .commit: commit()
+        case .commit:
+            Diagnostics.shared.record("shortcutConfirmed", ["waitingForInventory": session.isLoading])
+            commit()
         case .cancel: cancel()
         case let .text(text): if model.query.count < 120 { updateSearch(model.query + text) }
         case .delete: updateSearch(String(model.query.dropLast()))
@@ -112,29 +117,31 @@ final class SwitcherController {
         requestID = UUID()
         let token = requestID
         session.begin(backward: backward)
+        model.presentationID = token
         model.loading = true
         model.query = ""
         model.sameApp = sameApp
         model.isDemo = demo
         model.windows = []
         model.selectedID = nil
-        thumbnails.clear()
+        thumbnails.begin(token, enabled: !demo && preferences.showThumbnails && preferences.screenRecordingGranted && !preferences.compact)
         let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
         lastScreen = screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            guard let self, self.requestID == token, self.session.isActive else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + (pinned ? 0 : 0.04)) { [weak self] in
+            guard let self, self.requestID == token, self.session.isActive, !self.session.commitWhenReady else { return }
             self.showPanel()
         }
         let complete: (WindowInventory) -> Void = { [weak self] inventory in
             guard let self, self.requestID == token, self.session.isActive else { return }
             self.allWindows = inventory.windows
-            self.session.load(inventory.windows.map(\.id), currentID: pinned ? nil : inventory.focusedID)
+            self.session.load(inventory.windows.map(\.id), currentID: pinned && !demo ? nil : inventory.focusedID)
             self.model.loading = false
-            Diagnostics.shared.record("inventory", ["count": inventory.windows.count])
+            let focused = inventory.windows.first { $0.id == inventory.focusedID }
+            Diagnostics.shared.record("inventory", ["count": inventory.windows.count, "cached": inventory.cached,
+                                                      "focusSource": inventory.focusSource, "focusedWindow": focused?.windowID ?? 0])
             self.updateSearch(self.model.query)
             if self.session.commitWhenReady { self.commit(); return }
-            self.resizePanel()
-            self.thumbnails.load(inventory.windows, allowed: !demo && self.preferences.showThumbnails && self.preferences.screenRecordingGranted)
+            if self.panel?.isVisible == true { self.resizePanel() }
         }
         if demo {
             complete(WindowInventory(windows: DemoWindows.entries, focusedID: DemoWindows.entries.first?.id))
@@ -142,21 +149,23 @@ final class SwitcherController {
             let maxY = NSScreen.screens.first?.frame.maxY ?? 0
             let cgScreen = screen.map { CGRect(x: $0.frame.minX, y: maxY - $0.frame.maxY, width: $0.frame.width, height: $0.frame.height) }
             service.discover(includeMinimized: preferences.includeMinimized,
-                             onlyPID: sameApp ? NSWorkspace.shared.frontmostApplication?.processIdentifier : nil,
-                             screen: preferences.currentScreenOnly ? cgScreen : nil, completion: complete)
+                             sameApp: sameApp, screen: preferences.currentScreenOnly ? cgScreen : nil,
+                             resolveFrontWindow: !pinned, completion: complete)
         }
     }
 
     private func updateSearch(_ query: String) {
         model.query = query
         guard !session.isLoading else { return }
-        model.windows = allWindows.filter { WindowSearch.matches(query: query, title: $0.title, app: $0.appName) }
+        model.windows = query.isEmpty ? allWindows : allWindows.filter { WindowSearch.matches(query: query, title: $0.title, app: $0.appName) }
         session.filter(to: model.windows.map(\.id))
         syncSelection()
     }
 
     private func syncSelection() {
+        guard model.selectedID != session.selectedID else { return }
         model.selectedID = session.selectedID
+        thumbnails.prioritize(session.selectedID)
         if let window = allWindows.first(where: { $0.id == session.selectedID }) {
             Diagnostics.shared.record("selection", ["pid": window.pid, "window": window.windowID ?? 0, "minimized": window.minimized])
         }
@@ -182,7 +191,7 @@ final class SwitcherController {
         session.cancel()
         hotkeys.endSession()
         requestID = UUID()
-        panel?.orderOut(nil)
+        if panel?.isVisible == true { panel?.orderOut(nil) }
         thumbnails.clear()
         allWindows = []
         model.windows = []
@@ -191,11 +200,17 @@ final class SwitcherController {
         model.loading = false
     }
 
+    func shutdown() {
+        cancel()
+        hotkeys.stop()
+        service.stop()
+    }
+
     private func dismissIfOutside() {
         if session.isActive, let panel, panel.isVisible, !panel.frame.contains(NSEvent.mouseLocation) { cancel() }
     }
 
-    private func showPanel() {
+    private func preparePanel() {
         if panel == nil {
             let panel = SwitcherPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             panel.isOpaque = false
@@ -209,8 +224,13 @@ final class SwitcherController {
             panel.contentView = NSHostingView(rootView: SwitcherView(model: model, thumbnails: thumbnails, preferences: preferences))
             self.panel = panel
         }
+    }
+
+    private func showPanel() {
+        preparePanel()
         resizePanel()
         panel?.makeKeyAndOrderFront(nil)
+        thumbnails.panelDidShow()
         Diagnostics.shared.record("panel", ["visible": panel?.isVisible == true, "width": panel?.frame.width ?? 0, "height": panel?.frame.height ?? 0])
     }
 
@@ -221,6 +241,7 @@ final class SwitcherController {
         let columnWidth = (width - 48 - 24) / 3
         let rowHeight: CGFloat = preferences.compact ? 68 : columnWidth * 3 / 5 + 55
         let height = min(CGFloat(rows) * rowHeight + CGFloat(rows - 1) * 12 + 182, lastScreen.height - 64)
-        panel.setFrame(CGRect(x: lastScreen.midX - width / 2, y: lastScreen.midY - height / 2, width: width, height: height), display: true)
+        let frame = CGRect(x: lastScreen.midX - width / 2, y: lastScreen.midY - height / 2, width: width, height: height)
+        if panel.frame != frame { panel.setFrame(frame, display: false) }
     }
 }

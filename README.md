@@ -4,15 +4,15 @@
 
 ![瞬切窗口切换器，演示数据](docs/switcher.png)
 
-[下载 macOS Apple Silicon 预览版](https://github.com/xikee/WindowPilot/releases/tag/v1.0.0-preview.2) · [测试记录](docs/VALIDATION.md)
+[下载 macOS Apple Silicon 预览版](https://github.com/xikee/WindowPilot/releases/tag/v1.0.0-preview.3) · [测试记录](docs/VALIDATION.md)
 
 ## 打开应用
 
 从 Release 下载 ZIP，解压得到 `瞬切.app`。本地构建产物位于 `dist/瞬切.app`。应用常驻菜单栏，关闭设置窗口后仍然运行；从菜单栏选择「退出瞬切」结束。
 
-当前发布为 `v1.0.0-preview.2`（构建 2），要求 macOS 13+、Apple Silicon。本预览版使用本地临时签名，没有开发者公证；下载后如被 macOS 阻止，可能需要在系统「隐私与安全性」中允许打开。
+当前发布为 `v1.0.0-preview.3`（构建 6），要求 macOS 13+、Apple Silicon。本预览版使用本地临时签名，没有开发者公证；下载后如被 macOS 阻止，可能需要在系统「隐私与安全性」中允许打开。
 
-已在 macOS 14.8.9 授予辅助功能、屏幕录制权限后实测全局快捷键、真实预览、窗口搜索、精确激活、最小化恢复和隐藏应用恢复。第二个预览版修复了原生退出快捷键、本地辅助功能输入，以及最小化窗口阻塞截图队列的问题。
+第三个预览版缩短了面板出现前的等待，修复了刚打开窗口时首次切换，以及按住 Option 连点 Tab 时高亮落后一格的问题。已在 macOS 14.8.9 实测「所有窗口」和「当前应用」两种快捷键，松开 Option 后会置前最后高亮的窗口。
 
 第一次使用时，在「隐私与权限」中：
 
@@ -42,7 +42,7 @@
 
 支持鼠标点击、最近使用排序、恢复最小化窗口、显示隐藏应用窗口、多显示器定位、仅当前显示器筛选，以及无预览的紧凑布局。主修饰键可改为 Control 或 Command；选择 Command 会接管 `⌘ Tab`。
 
-窗口列表在打开时刷新。缩略图为本次打开时的静态截图，不是实时视频；仅保存在内存中，面板关闭后清空。macOS 14+ 使用 ScreenCaptureKit，macOS 13 使用 Core Graphics 兼容实现。
+窗口列表在后台更新；唤出时直接读取最近的窗口数据。切换到选中的窗口不必等后台刷新完成。缩略图在面板打开后按卡片请求，并分批更新；紧凑模式不截图。预览仅保存在内存中，面板关闭后清空。macOS 14+ 使用 ScreenCaptureKit，macOS 13 使用 Core Graphics 兼容实现。
 
 ## 构建与验证
 

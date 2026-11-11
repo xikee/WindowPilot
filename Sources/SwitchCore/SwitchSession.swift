@@ -8,6 +8,7 @@ public struct SwitchSession {
     public private(set) var commitWhenReady = false
     public private(set) var isActive = false
     private var pendingSteps = 0
+    private var fallbackOrigin = -1
 
     public init() {}
 
@@ -18,13 +19,14 @@ public struct SwitchSession {
         isLoading = true
         commitWhenReady = false
         pendingSteps = backward ? -1 : 1
+        fallbackOrigin = backward ? 0 : -1
     }
 
     public mutating func load(_ newIDs: [String], currentID: String?) {
         guard isActive else { return }
         ids = newIDs
         isLoading = false
-        let origin = currentID.flatMap { ids.firstIndex(of: $0) } ?? 0
+        let origin = currentID.flatMap { ids.firstIndex(of: $0) } ?? fallbackOrigin
         selectedID = ids.isEmpty ? nil : ids[wrapped(origin + pendingSteps)]
         pendingSteps = 0
     }

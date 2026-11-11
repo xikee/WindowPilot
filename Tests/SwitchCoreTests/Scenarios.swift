@@ -24,6 +24,19 @@ let switchScenarios: [(String, () throws -> Void)] = [
         session.load(["a", "b", "c"], currentID: "a")
         try expect(session.selectedID == "c", "反向首次应选中末尾")
     }),
+    ("原窗口不在列表时从边界开始", {
+        var session = SwitchSession()
+        session.begin(backward: false)
+        session.load(["a", "b", "c"], currentID: "closed")
+        try expect(session.selectedID == "a", "原窗口不可用时应选择最近窗口")
+        session.begin(backward: false)
+        session.move(-1)
+        session.load(["a", "b", "c"], currentID: nil)
+        try expect(session.selectedID == "c", "加载期间的反向操作应从首项向前循环")
+        session.begin(backward: true)
+        session.load(["a", "b", "c"], currentID: nil)
+        try expect(session.selectedID == "c", "反向启动时应选择末项")
+    }),
     ("快速松键保留切换意图", {
         var session = SwitchSession()
         session.begin(backward: false)
@@ -31,6 +44,17 @@ let switchScenarios: [(String, () throws -> Void)] = [
         session.load(["a", "b"], currentID: "a")
         try expect(session.release() == "b", "加载后应提交正确窗口")
         try expect(!session.isActive, "提交后应结束会话")
+    }),
+    ("刚打开的窗口不会被第一次切换重新选中", {
+        let recent = ["previous", "older"]
+        for snapshot in [["previous", "new", "older"], ["previous", "older"]] {
+            var session = SwitchSession()
+            session.begin(backward: false)
+            try expect(session.release() == nil && session.commitWhenReady, "焦点查询返回前的松键应保留")
+            let ordered = WindowOrder.byRecency(snapshot, id: \.self, focusedID: "new", recent: recent)
+            session.load(ordered, currentID: "new")
+            try expect(session.release() == "previous", "第一次切换必须回到上一窗口，即使新窗口还没进快照")
+        }
     }),
     ("加载期间连续按键", {
         var session = SwitchSession()
