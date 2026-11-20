@@ -114,6 +114,7 @@ final class SwitcherController {
 
     private func begin(backward: Bool, sameApp: Bool, demo: Bool = false, pinned: Bool = false) {
         Diagnostics.shared.record("begin", ["backward": backward, "sameApp": sameApp, "demo": demo, "pinned": pinned])
+        service.cancelActivation()
         requestID = UUID()
         let token = requestID
         session.begin(backward: backward)
@@ -138,6 +139,7 @@ final class SwitcherController {
             self.model.loading = false
             let focused = inventory.windows.first { $0.id == inventory.focusedID }
             Diagnostics.shared.record("inventory", ["count": inventory.windows.count, "cached": inventory.cached,
+                                                      "catalogAgeMS": inventory.catalogAgeMS,
                                                       "focusSource": inventory.focusSource, "focusedWindow": focused?.windowID ?? 0])
             self.updateSearch(self.model.query)
             if self.session.commitWhenReady { self.commit(); return }
@@ -179,10 +181,13 @@ final class SwitcherController {
         Diagnostics.shared.record("commit", ["loading": session.isLoading, "hasTarget": window != nil, "demo": isDemo])
         cancel()
         guard !isDemo, let window else { return }
-        service.activate(window) { [weak self] success in
-            Diagnostics.shared.record("activation", ["success": success, "pid": window.pid, "window": window.windowID ?? 0,
+        service.activate(window) { [weak self] result in
+            Diagnostics.shared.record("activation", ["success": result == .confirmed, "reason": result.rawValue,
+                                                      "pid": window.pid, "window": window.windowID ?? 0,
                                                       "frontmostPID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0])
-            if !success { self?.preferences.statusMessage = "窗口已关闭或暂时无法切换，请重新打开切换器。" }
+            if result != .confirmed && result != .superseded {
+                self?.preferences.statusMessage = "未能确认目标窗口已置前，请重新打开切换器重试。"
+            }
         }
     }
 
