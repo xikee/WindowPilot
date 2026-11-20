@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 import SwitchCore
 
 struct ScenarioFailure: Error, CustomStringConvertible {
@@ -111,6 +112,38 @@ let switchScenarios: [(String, () throws -> Void)] = [
                 try expect(session.selectedID == expected, "循环索引越界：\(count), \(steps)")
             }
         }
+    }),
+    ("同名但不同位置的窗口不能关联截图", {
+        let frame = CGRect(x: 10, y: 20, width: 800, height: 600)
+        let candidates = [WindowMatchCandidate(id: 1, bounds: frame.offsetBy(dx: 500, dy: 0), title: "文稿")]
+        try expect(WindowMatcher.match(bounds: frame, title: "文稿", candidates: candidates) == nil, "标题相同不能越过几何约束")
+    }),
+    ("重叠窗口只使用无歧义的匹配", {
+        let frame = CGRect(x: 10, y: 20, width: 800, height: 600)
+        let candidates = [WindowMatchCandidate(id: 1, bounds: frame, title: "A"),
+                          WindowMatchCandidate(id: 2, bounds: frame, title: "B")]
+        try expect(WindowMatcher.match(bounds: frame, title: "B", candidates: candidates) == 2, "同位置时标题可以消除歧义")
+        try expect(WindowMatcher.match(bounds: frame, title: "", candidates: candidates) == nil, "同位置且没有标题时不能猜测")
+        let duplicate = candidates + [WindowMatchCandidate(id: 3, bounds: frame, title: "B")]
+        try expect(WindowMatcher.match(bounds: frame, title: "B", candidates: duplicate) == nil, "同名重叠时不能猜测")
+        try expect(WindowMatcher.match(bounds: frame, title: "AX标题", candidates: [WindowMatchCandidate(id: 4, bounds: frame, title: nil)]) == 4, "唯一几何匹配不要求屏幕录制权限提供标题")
+    }),
+    ("多个 AX 窗口争用同一截图编号时全部放弃关联", {
+        let frame = CGRect(x: 10, y: 20, width: 800, height: 600)
+        let candidates = [WindowMatchCandidate(id: 1, bounds: frame, title: "文稿")]
+        let windows = [(id: "a", bounds: frame, title: "文稿"), (id: "b", bounds: frame, title: "文稿")]
+        try expect(WindowMatcher.matchAll(windows, candidates: candidates).isEmpty, "不能用枚举顺序决定截图归属")
+        try expect(WindowMatcher.matchAll(Array(windows.reversed()), candidates: candidates).isEmpty, "倒序也应保守降级")
+    }),
+    ("目录过期以最后成功读取为准", {
+        var freshness = CatalogFreshness(lifetime: 6)
+        freshness.record("slow", at: 10)
+        try expect(freshness.isFresh("slow", at: 15), "短暂超时应保留窗口")
+        try expect(!freshness.isFresh("slow", at: 17), "重复超时不能永久续期")
+        try expect(!freshness.isFresh("unknown", at: 10), "未成功读取的窗口不可当作缓存")
+        freshness.record("slow", at: 18)
+        freshness.retain([])
+        try expect(!freshness.isFresh("slow", at: 18), "关闭窗口应移除时间记录")
     }),
     ("新会话不继承旧搜索和确认状态", {
         var session = SwitchSession()
