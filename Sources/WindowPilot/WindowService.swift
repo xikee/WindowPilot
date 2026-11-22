@@ -22,6 +22,7 @@ struct WindowInventory {
     var cached = false
     var focusSource = "none"
     var catalogAgeMS: Double = 0
+    var incomplete = false
 }
 
 private func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
@@ -52,7 +53,7 @@ final class WindowService {
 
     private struct Catalog {
         var windows: [WindowEntry]
-        let pids: Set<pid_t>
+        let coverage: CatalogCoverage
         let updatedAt: TimeInterval
         var freshness: CatalogFreshness
     }
@@ -60,6 +61,7 @@ final class WindowService {
     private struct ScanResult {
         let windows: [WindowEntry]
         let freshness: CatalogFreshness
+        let coverage: CatalogCoverage
         let nextPID: pid_t?
         let windowOffsets: [pid_t: Int]
         let budgetExpired: Bool
@@ -89,12 +91,21 @@ final class WindowService {
     private var nextScanPID: pid_t?
     private var windowOffsets: [pid_t: Int] = [:]
     private var observerRetryAfter: [pid_t: TimeInterval] = [:]
-    private var observedWindows: [pid_t: [String: AXUIElement]] = [:]
+    private final class WindowObservation {
+        let element: AXUIElement
+        var registrations = NotificationRegistration()
+        init(_ element: AXUIElement) { self.element = element }
+    }
+    private var observedWindows: [pid_t: [String: WindowObservation]] = [:]
     private var catalogEpoch = 0
     private var lifecycleEpoch = 0
     private var refreshing = false
     private var refreshAgain = false
-    private var waiters: [(Catalog) -> Void] = []
+    // 同时只有一个切换面板。冷启动时等请求范围真正扫到后再冻结本次选择列表。
+    private var pendingDiscovery: ((Catalog) -> Void)?
+    private var requestedPID: pid_t?
+    private var discoveryID = UUID()
+    private var invalidatedDuringScan = Set<String>()
     private var focusPending: pid_t?
     private var readingFocus = false
     private var focusRevision = 0
@@ -159,7 +170,8 @@ final class WindowService {
         windowOffsets.removeAll()
         activator.cancel()
         catalog = nil
-        waiters.removeAll()
+        cancelDiscovery()
+        invalidatedDuringScan.removeAll()
         readingFocus = false
         focusPending = nil
         recent.removeAll()
@@ -178,7 +190,10 @@ final class WindowService {
         let epoch = catalogEpoch
         let previous = catalog?.windows ?? []
         let freshness = catalog?.freshness ?? CatalogFreshness()
-        let nextPID = nextScanPID
+        let coverage = catalog?.coverage ?? CatalogCoverage()
+        let nextPID = requestedPID ?? nextScanPID
+        requestedPID = nil
+        invalidatedDuringScan.removeAll()
         let offsets = windowOffsets
         let request = UUID()
         refreshRequest = request
@@ -195,7 +210,7 @@ final class WindowService {
         let pids = Set(apps.keys)
         syncObservers(pids)
         catalogQueue.async { [weak self] in
-            let result = Self.scan(appInfos, previous: previous, freshness: freshness, nextPID: nextPID, windowOffsets: offsets)
+            let result = Self.scan(appInfos, previous: previous, freshness: freshness, coverage: coverage, nextPID: nextPID, windowOffsets: offsets)
             DispatchQueue.main.async {
                 guard let self, self.refreshRequest == request else { return }
                 self.refreshing = false
@@ -203,15 +218,15 @@ final class WindowService {
                 if self.started, self.catalogEpoch == epoch {
                     self.nextScanPID = result.nextPID
                     self.windowOffsets = result.windowOffsets
-                    self.catalog = Catalog(windows: result.windows, pids: pids,
+                    let live = result.windows.filter { !self.invalidatedDuringScan.contains($0.id) }
+                    self.catalog = Catalog(windows: live, coverage: result.coverage,
                                            updatedAt: ProcessInfo.processInfo.systemUptime, freshness: result.freshness)
-                    self.syncWindowNotifications(result.windows)
+                    self.syncWindowNotifications(live)
                     Diagnostics.shared.record("catalog", ["count": result.windows.count,
                         "durationMS": (ProcessInfo.processInfo.systemUptime - beganAt) * 1000,
                         "budgetExpired": result.budgetExpired])
-                    let callbacks = self.waiters
-                    self.waiters.removeAll()
-                    if let catalog = self.catalog { callbacks.forEach { $0(catalog) } }
+                    if let catalog = self.catalog { self.pendingDiscovery?(catalog) }
+                    if self.pendingDiscovery != nil && coverage != result.coverage { self.refreshAgain = true }
                 }
                 if self.refreshAgain { self.refresh() }
             }
@@ -286,23 +301,32 @@ final class WindowService {
             let current = Dictionary(uniqueKeysWithValues: (grouped[pid] ?? []).compactMap { window in
                 window.element.map { (window.id, $0) }
             })
-            let previous = observedWindows[pid] ?? [:]
-            let removed = previous.filter { current[$0.key] == nil }
-            let added = current.filter { previous[$0.key] == nil }
-            guard !removed.isEmpty || !added.isEmpty else { continue }
-            observedWindows[pid] = current
-            observerQueue.async { [weak self] in
-                guard let self else { return }
-                for element in removed.values {
-                    for notification in notifications { AXObserverRemoveNotification(observer, element, notification as CFString) }
+            var states = observedWindows[pid] ?? [:]
+            for (id, state) in states where current[id].map({ CFEqual($0, state.element) }) != true {
+                states.removeValue(forKey: id)
+                observerQueue.async {
+                    for name in notifications { AXObserverRemoveNotification(observer, state.element, name as CFString) }
                 }
-                for element in added.values {
+            }
+            for (id, element) in current {
+                let state = states[id] ?? WindowObservation(element)
+                states[id] = state
+                let missing = state.registrations.begin(notifications, now: ProcessInfo.processInfo.systemUptime)
+                guard !missing.isEmpty else { continue }
+                observerQueue.async { [weak self] in
+                    guard let self else { return }
                     AXUIElementSetMessagingTimeout(element, 0.06)
-                    for notification in notifications {
-                        AXObserverAddNotification(observer, element, notification as CFString, Unmanaged.passUnretained(self).toOpaque())
+                    let settled = missing.filter { name in
+                        let code = AXObserverAddNotification(observer, element, name as CFString, Unmanaged.passUnretained(self).toOpaque())
+                        return code == .success || code == .notificationAlreadyRegistered || code == .notificationUnsupported || code == .notImplemented
+                    }
+                    DispatchQueue.main.async {
+                        guard self.observedWindows[pid]?[id] === state else { return }
+                        state.registrations.finish(settled: settled, now: ProcessInfo.processInfo.systemUptime)
                     }
                 }
             }
+            observedWindows[pid] = states
         }
     }
 
@@ -363,7 +387,10 @@ final class WindowService {
     func discover(includeMinimized: Bool, sameApp: Bool, screen: CGRect?, resolveFrontWindow: Bool,
                   completion: @escaping (WindowInventory) -> Void) {
         let frontPID = resolveFrontWindow ? NSWorkspace.shared.frontmostApplication?.processIdentifier : nil
+        cancelDiscovery()
+        let token = discoveryID
         let onlyPID = sameApp ? frontPID : nil
+        let scope = onlyPID.map { Set([$0]) } ?? Set(runningApps().map(\.processIdentifier))
         let deliver: (Catalog, Bool, FrontWindow) -> Void = { [weak self] catalog, cached, focus in
             guard let self else { return }
             let live = Dictionary(uniqueKeysWithValues: self.runningApps().map { ($0.processIdentifier, $0.isHidden) })
@@ -391,7 +418,8 @@ final class WindowService {
             }
             let ordered = WindowOrder.byRecency(windows, id: \.id, focusedID: current, recent: self.recent)
             completion(WindowInventory(windows: ordered, focusedID: current, cached: cached, focusSource: source,
-                                       catalogAgeMS: max(0, now - catalog.updatedAt) * 1000))
+                                       catalogAgeMS: max(0, now - catalog.updatedAt) * 1000,
+                                       incomplete: catalog.coverage.hasUnavailable(in: scope.intersection(live.keys))))
         }
         let resolve: (Catalog, Bool) -> Void = { [weak self] catalog, cached in
             guard let self else { return }
@@ -400,27 +428,48 @@ final class WindowService {
             self.shortcutFocusQueue.async { [weak self] in
                 let focus = Self.frontWindow(pid: pid)
                 DispatchQueue.main.async {
-                    guard let self, self.started, self.catalogEpoch == epoch else { return }
+                    guard let self, self.started, self.catalogEpoch == epoch, self.discoveryID == token else { return }
                     deliver(self.catalog ?? catalog, cached, focus)
                 }
             }
         }
-        if let catalog, onlyPID.map(catalog.pids.contains) != false {
+        if let catalog, catalog.coverage.pending(in: scope).isEmpty {
             resolve(catalog, true)
         } else if started {
-            waiters.append { resolve($0, false) }
-            refresh()
+            requestedPID = onlyPID
+            pendingDiscovery = { [weak self] snapshot in
+                guard let self, self.discoveryID == token else { return }
+                let remaining = snapshot.coverage.pending(in: scope.intersection(self.runningApps().map(\.processIdentifier)))
+                guard remaining.isEmpty else {
+                    if let onlyPID, remaining.contains(onlyPID) { self.requestedPID = onlyPID }
+                    return // 已有轮转定时器；不为一直没响应的系统调用启动忙循环。
+                }
+                self.pendingDiscovery = nil
+                self.requestedPID = nil
+                resolve(snapshot, false)
+            }
+            refresh(followUp: true)
         } else {
             completion(WindowInventory(windows: [], focusedID: nil))
         }
     }
 
+    func cancelDiscovery() {
+        discoveryID = UUID()
+        pendingDiscovery = nil
+        requestedPID = nil
+    }
+
     private static func scan(_ apps: [AppInfo], previous: [WindowEntry], freshness: CatalogFreshness,
-                             nextPID: pid_t?, windowOffsets: [pid_t: Int]) -> ScanResult {
+                             coverage: CatalogCoverage, nextPID: pid_t?, windowOffsets: [pid_t: Int]) -> ScanResult {
         // 预算在每次 IPC 之间生效，不能中断系统内部调用；单次 AX 查询另设 60ms 超时。
         let deadline = ProcessInfo.processInfo.systemUptime + 0.75
         var freshness = freshness
-        var offsets = windowOffsets.filter { pid, _ in apps.contains { $0.pid == pid } }
+        var coverage = coverage
+        let livePIDs = Set(apps.map(\.pid))
+        coverage.retain(livePIDs)
+        var measuredTitles: [String: String] = [:]
+        var offsets = windowOffsets.filter { livePIDs.contains($0.key) }
         let descriptions = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         var candidates: [pid_t: [CGWindow]] = [:]
         for (rank, info) in descriptions.enumerated() {
@@ -452,13 +501,22 @@ final class WindowService {
             AXUIElementSetMessagingTimeout(element, Float(min(0.06, max(0.001, appDeadline - now))))
             var value: CFTypeRef?
             let result = AXUIElementCopyAttributeValue(element, kAXWindowsAttribute as CFString, &value)
-            if result == .cannotComplete {
-                entries += old.filter { freshness.isFresh($0.id, at: ProcessInfo.processInfo.systemUptime) }
+            guard result == .success, let windows = value as? [AXUIElement] else {
+                if result == .attributeUnsupported || result == .noValue {
+                    coverage.listed(app.pid, ids: [], checked: [])
+                } else {
+                    coverage.failed(app.pid)
+                    entries += old.filter { freshness.isFresh($0.id, at: ProcessInfo.processInfo.systemUptime) }
+                }
                 continue
             }
-            guard result == .success, let windows = value as? [AXUIElement] else { continue }
             let identities = windows.map { elementID($0, pid: app.pid) }
-            var retained = Dictionary(uniqueKeysWithValues: old.filter { identities.contains($0.id) && freshness.isFresh($0.id, at: now) }.map { ($0.id, $0) })
+            let listed = Set(identities)
+            var checked = Set<String>()
+            var unreadable = Set<String>()
+            // 列表中仍有这个 AX 引用就能保留条目，但不代表已验证它的坐标。
+            var retained = Dictionary(uniqueKeysWithValues: old.filter { listed.contains($0.id) }.map { ($0.id, $0) })
+            for id in retained.keys { freshness.record(id, at: now) }
             let offset = windows.isEmpty ? 0 : offsets[app.pid, default: 0] % windows.count
             for step in 0..<windows.count {
                 let position = (offset + step) % windows.count
@@ -470,7 +528,8 @@ final class WindowService {
                 AXUIElementSetMessagingTimeout(window, Float(min(0.06, max(0.001, appDeadline - currentTime))))
                 var values: CFArray?
                 let result = AXUIElementCopyMultipleAttributeValues(window, names, [], &values)
-                if result == .cannotComplete { continue }
+                checked.insert(id)
+                if result == .cannotComplete { unreadable.insert(id); continue }
                 retained.removeValue(forKey: id)
                 guard result == .success, let attributes = values as? [Any], attributes.count == 5,
                       let bounds = frame(position: attributes[0], size: attributes[1]), bounds.width > 80, bounds.height > 50 else { continue }
@@ -481,15 +540,17 @@ final class WindowService {
                                           title: title.isEmpty ? app.name : title, bounds: bounds,
                                           minimized: attributes[3] as? Bool ?? false, hidden: app.hidden, element: window, icon: app.icon)
                 freshness.record(id, at: ProcessInfo.processInfo.systemUptime)
+                measuredTitles[id] = title
             }
+            coverage.listed(app.pid, ids: listed, checked: checked, failed: unreadable)
             entries += retained.values
         }
         let finishedAt = ProcessInfo.processInfo.systemUptime
         entries = entries.filter { freshness.isFresh($0.id, at: finishedAt) }
-        // 超时沿用的条目也重新核对本轮 CG 候选，不能继续持有可能已被复用的截图编号。
+        // 仅用本轮测得的几何认领截图。沿用条目保留 AX 切换能力，不保留旧编号。
         entries = Dictionary(grouping: entries, by: \.pid).flatMap { pid, windows -> [WindowEntry] in
             let matching = (candidates[pid] ?? []).map { WindowMatchCandidate(id: $0.id, bounds: $0.bounds, title: $0.title) }
-            let associations = WindowMatcher.matchAll(windows.map { ($0.id, $0.bounds, $0.title) }, candidates: matching)
+            let associations = WindowMatcher.matchMeasured(windows.map { ($0.id, $0.bounds) }, titlesThisScan: measuredTitles, candidates: matching)
             return windows.map { window in
                 var window = window
                 window.windowID = associations[window.id]
@@ -503,7 +564,7 @@ final class WindowService {
             let b = rhs.windowID.flatMap { ranks[$0] } ?? Int.max
             return a == b ? lhs.id < rhs.id : a < b
         }
-        return ScanResult(windows: entries, freshness: freshness, nextPID: resumePID,
+        return ScanResult(windows: entries, freshness: freshness, coverage: coverage, nextPID: resumePID,
                           windowOffsets: offsets, budgetExpired: budgetExpired)
     }
 
@@ -512,7 +573,14 @@ final class WindowService {
     func activate(_ window: WindowEntry, completion: @escaping (WindowActivationResult) -> Void) {
         activator.activate(window) { [weak self] result in
             if result == .confirmed { self?.remember(window.id) }
-            else if result != .superseded { self?.refresh(followUp: true) }
+            else if result != .superseded, let self {
+                if result == .invalidTarget {
+                    self.catalog?.windows.removeAll { $0.id == window.id }
+                    self.recent.removeAll { $0 == window.id }
+                    if self.refreshing { self.invalidatedDuringScan.insert(window.id) }
+                }
+                self.refresh(followUp: true)
+            }
             completion(result)
         }
     }
