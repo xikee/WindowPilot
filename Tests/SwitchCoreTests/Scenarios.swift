@@ -145,6 +145,40 @@ let switchScenarios: [(String, () throws -> Void)] = [
         freshness.retain([])
         try expect(!freshness.isFresh("slow", at: 18), "关闭窗口应移除时间记录")
     }),
+    ("冷启动按范围等待真正检查过的窗口", {
+        var coverage = CatalogCoverage()
+        coverage.listed(1, ids: [], checked: [])
+        coverage.listed(2, ids: ["A", "B"], checked: ["A"])
+        try expect(coverage.pending(in: [1]).isEmpty, "已扫空的应用不必等待其他应用")
+        try expect(coverage.pending(in: [1, 2, 3]) == [2, 3], "部分扫描或未扫描的应用不可当成空")
+        coverage.listed(2, ids: ["A", "B"], checked: ["B"], failed: ["B"])
+        coverage.failed(3)
+        try expect(coverage.pending(in: [1, 2, 3]).isEmpty && coverage.hasUnavailable(in: [2, 3]), "系统不响应不能变成无限等待或确定空列表")
+        coverage.listed(2, ids: ["A", "B"], checked: ["B"])
+        try expect(!coverage.hasUnavailable(in: [2]), "下一次成功读取应解除失败标志")
+        coverage.listed(2, ids: ["A", "B", "新窗口"], checked: ["A"])
+        try expect(coverage.pending(in: [2]) == [2], "新发现但没读到的窗口应重新打开覆盖缺口")
+        coverage.retain([1])
+        try expect(coverage.pending(in: [2]) == [2] && !coverage.hasUnavailable(in: [3]), "退出应用不能遗留状态")
+    }),
+    ("旧窗口位置不参与预览匹配", {
+        let frame = CGRect(x: 0, y: 0, width: 800, height: 600)
+        let windows = [(id: "旧", bounds: frame), (id: "新", bounds: frame)]
+        let candidate = [WindowMatchCandidate(id: 99, bounds: frame, title: "新文档")]
+        try expect(WindowMatcher.matchMeasured(windows, titlesThisScan: [:], candidates: candidate).isEmpty, "跳过或超时均应清除旧编号")
+        try expect(WindowMatcher.matchMeasured(windows, titlesThisScan: ["新": "新文档"], candidates: candidate) == ["新": 99], "只有本轮实际测量的窗口可以认领截图")
+        try expect(WindowMatcher.match(bounds: frame, title: "旧文档", candidates: candidate) == nil, "已知标题相反时不能靠位置猜测")
+    }),
+    ("通知仅退避重试临时失败项", {
+        var registration = NotificationRegistration()
+        let names = ["移动", "标题", "不支持"]
+        try expect(registration.begin(names, now: 0) == names && registration.begin(names, now: 1).isEmpty, "阻止重叠注册")
+        registration.finish(settled: ["标题", "不支持"], now: 1)
+        try expect(registration.begin(names, now: 5).isEmpty, "未到退避时间不可重试")
+        try expect(registration.begin(names, now: 6) == ["移动"], "仅重试未完成的订阅")
+        registration.finish(settled: ["移动"], now: 7)
+        try expect(registration.begin(names, now: 20).isEmpty, "成功项不能重复注册")
+    }),
     ("新会话不继承旧搜索和确认状态", {
         var session = SwitchSession()
         session.begin(backward: false)
