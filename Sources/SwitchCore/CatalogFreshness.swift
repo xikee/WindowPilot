@@ -1,6 +1,6 @@
 import Foundation
 
-/// 以单调时钟记录每个窗口的最后成功读取时间，慢应用不能无限保留已关闭的条目。
+/// 记录窗口最后得到存在性确认的单调时间；这不是其几何位置的验证时间。
 public struct CatalogFreshness {
     public let lifetime: TimeInterval
     private var validated: [String: TimeInterval] = [:]
