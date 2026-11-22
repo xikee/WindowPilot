@@ -81,8 +81,8 @@ private func entry(_ id: CGWindowID, minimized: Bool = false, hidden: Bool = fal
     WindowEntry(id: String(id), windowID: id, minimized: minimized, hidden: hidden)
 }
 
-private func testImage() -> CGImage {
-    let context = CGContext(data: nil, width: 4, height: 4, bitsPerComponent: 8, bytesPerRow: 16,
+private func testImage(height: Int = 4) -> CGImage {
+    let context = CGContext(data: nil, width: 4, height: height, bitsPerComponent: 8, bytesPerRow: 16,
                             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
     return context.makeImage()!
 }
@@ -125,7 +125,9 @@ private enum ThumbnailTests {
             ("正常成功推进、可见项与选择优先", normalProgress),
             ("数量上限保护可见项且离屏淘汰后可重拍", countCapacity),
             ("待发布图片也计入容量", pendingCapacity),
-            ("像素字节上限与超大图片降级", byteCapacity),
+            ("字节预算用尽后随窗口离屏恢复", byteCapacity),
+            ("空间不足时保留缓存并暂停重试", insufficientReclaimableBytes),
+            ("单图超预算时在本会话内降级", oversizedImage),
             ("clear 隔离待发布图片和旧定时任务", pendingFlushAcrossSessions),
             ("禁用、展示延迟和失败降级", enableAndFailure)
         ]
@@ -289,29 +291,64 @@ private enum ThumbnailTests {
     private static func byteCapacity() throws {
         let image = testImage()
         let bytes = image.bytesPerRow * image.height
-        let h = Harness(maxImages: 10, maxBytes: 2 * bytes - 1)
-        h.open([1, 2, 3])
-        h.backend.finishCapture(image)
-        h.backend.finishCapture(image)
+        let h = Harness(maxImages: 10, maxBytes: bytes)
+        h.open([1, 2])
         h.backend.finishCapture(image)
         h.flush()
-        try expect(Set(h.store.images.keys) == ["1"], "字节不足时不能淘汰可见图片或突破字节上限")
+        for _ in 0..<50 { h.store.prioritize("2") }
+        try expect(h.backend.captureIDs == [1] && h.backend.inFlight == 0, "可见图片用尽字节预算后应暂停截图")
         h.store.remove("1", presentation: h.presentation)
-        h.store.request(entry(4), presentation: h.presentation)
+        try expect(h.backend.captureIDs == [1, 2], "窗口离屏后应自动为等待窗口截图")
         h.backend.finishCapture(image)
         h.flush()
-        try expect(Set(h.store.images.keys) == ["4"], "字节容量应通过淘汰离屏项腾出空间")
-        h.store.remove("4", presentation: h.presentation)
+        try expect(Set(h.store.images.keys) == ["2"], "等待窗口应在同一会话内恢复图片")
         h.store.request(entry(1), presentation: h.presentation)
-        try expect(h.backend.captureIDs == [1, 2, 3, 4, 1], "因字节预算淘汰的项滚回后也应允许重拍")
+        h.store.remove("2", presentation: h.presentation)
+        try expect(h.backend.captureIDs == [1, 2, 1], "因字节预算淘汰的图片滚回后应可重拍")
         h.backend.finishCapture(image)
         h.flush()
-        try expect(Set(h.store.images.keys) == ["1"], "字节淘汰后的重拍应恢复图片且不突破上限")
-        let small = Harness(maxBytes: bytes - 1)
-        small.open([1])
+        try expect(Set(h.store.images.keys) == ["1"], "重拍应恢复图片并遵守字节预算")
+    }
+
+    private static func insufficientReclaimableBytes() throws {
+        let small = testImage(height: 1)
+        let large = testImage(height: 3)
+        let h = Harness(maxBytes: large.bytesPerRow * large.height + 2 * small.bytesPerRow)
+        h.open([1, 2, 3, 4])
+        h.backend.finishCapture(large)
+        h.backend.finishCapture(small)
+        h.flush()
+        h.store.remove("2", presentation: h.presentation)
+        h.backend.finishCapture(large)
+        try expect(h.backend.captureIDs == [1, 2, 3, 4], "窗口 3 等待容量时应继续处理窗口 4")
+        h.backend.finishCapture(large)
+        for _ in 0..<50 {
+            h.store.request(entry(2), presentation: h.presentation)
+            h.store.remove("2", presentation: h.presentation)
+            h.store.prioritize("4")
+        }
+        h.scheduler.advance(10)
+        try expect(Set(h.store.images.keys) == ["1", "2"], "可回收空间不足时应保留离屏缓存")
+        try expect(h.backend.captureIDs == [1, 2, 3, 4] && h.backend.inFlight == 0, "容量仍不足时调度和计时器都不得重试")
+        h.store.remove("1", presentation: h.presentation)
+        try expect(h.backend.captureIDs == [1, 2, 3, 4, 4], "足够空间出现后应优先重拍选中的等待窗口")
+        h.backend.finishCapture(large)
+        h.flush()
+        try expect(h.store.images["4"] != nil && h.store.images["3"] == nil, "恢复后应发布选中窗口的图片")
+        try expect(h.backend.inFlight == 0 && h.backend.maximumInFlight == 1, "其余窗口应继续等待且最多一个截图在途")
+    }
+
+    private static func oversizedImage() throws {
+        let image = testImage()
+        let small = Harness(maxBytes: image.bytesPerRow * image.height - 1)
+        small.open([1, 2])
         small.backend.finishCapture(image)
+        small.backend.finishCapture(testImage(height: 1))
+        small.store.remove("2", presentation: small.presentation)
+        small.store.remove("1", presentation: small.presentation)
+        small.store.request(entry(1), presentation: small.presentation)
         small.flush()
-        try expect(small.store.images.isEmpty, "单张超预算图片必须降级")
+        try expect(Set(small.store.images.keys) == ["2"] && small.backend.captureIDs == [1, 2], "单图超预算后容量或可见性变化都不得触发重拍")
         let zero = Harness(maxImages: 0)
         zero.open([1])
         try expect(zero.backend.captureIDs.isEmpty, "零容量不应启动截图")
