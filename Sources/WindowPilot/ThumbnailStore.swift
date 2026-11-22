@@ -89,7 +89,9 @@ final class ThumbnailStore: ObservableObject {
     private var enumerationRequest: UUID?
     private var activeCapture: UUID?
     private var visible: [WindowEntry] = []
-    private var attempted = Set<String>()
+    private var unavailable = Set<String>()
+    // 保留上次截图的大小，容量不足或图片被淘汰后据此判断何时可以重拍。
+    private var requiredBytes: [String: Int] = [:]
     private var cache: [String: CachedImage] = [:]
     private var cachedBytes = 0
     private var access: UInt64 = 0
@@ -161,9 +163,23 @@ final class ThumbnailStore: ObservableObject {
         }
     }
 
+    // 离屏缓存可以回收，只有仍可见的图片会占用下一张截图的容量。
+    private var capacityAfterEviction: (slots: Int, bytes: Int) {
+        visible.reduce(into: (slots: policy.maxCachedImages, bytes: policy.maxCachedBytes)) { capacity, entry in
+            if let cached = cache[entry.id] {
+                capacity.slots -= 1
+                capacity.bytes -= cached.bytes
+            }
+        }
+    }
+
     private func pump() {
         guard enabled, ready, nativeRequest == nil else { return }
-        var candidates = visible.filter { !attempted.contains($0.id) }
+        let capacity = capacityAfterEviction
+        guard capacity.slots > 0, capacity.bytes > 0 else { return }
+        var candidates = visible.filter { entry in
+            cache[entry.id] == nil && !unavailable.contains(entry.id) && (requiredBytes[entry.id] ?? 1) <= capacity.bytes
+        }
         guard !candidates.isEmpty else { return }
         if let index = candidates.firstIndex(where: { $0.id == selectedID }) {
             candidates.insert(candidates.remove(at: index), at: 0)
@@ -172,16 +188,14 @@ final class ThumbnailStore: ObservableObject {
             enumerate()
             return
         }
-        guard policy.maxCachedImages > 0, policy.maxCachedBytes > 0 else { return }
-        let visibleIDs = Set(visible.map(\.id))
-        // 缓存被当前可见项占满时等待离屏；不能靠淘汰可见项制造截图循环。
-        guard cache.count < policy.maxCachedImages || cache.keys.contains(where: { !visibleIDs.contains($0) }) else { return }
         for entry in candidates {
-            attempted.insert(entry.id)
             guard let id = entry.windowID else { continue }
             let target: ThumbnailTarget
             if backend.requiresEnumeration {
-                guard let found = available?[id] else { continue }
+                guard let found = available?[id] else {
+                    unavailable.insert(entry.id)
+                    continue
+                }
                 target = found
             } else {
                 target = ThumbnailTarget(windowID: id)
@@ -222,6 +236,7 @@ final class ThumbnailStore: ObservableObject {
         schedule(policy.captureTimeout) { [weak self] in
             guard let self, self.generation == token, self.activeCapture == request else { return }
             self.activeCapture = nil
+            self.unavailable.insert(entry.id)
             Diagnostics.shared.record("thumbnailUnavailable", ["window": entry.windowID ?? 0, "reason": "timeout"])
             // 逻辑超时只显示图标。真实回调之前绝不能启动下一个原生操作。
         }
@@ -234,6 +249,7 @@ final class ThumbnailStore: ObservableObject {
                     self.cacheImage(image, for: entry.id)
                     Diagnostics.shared.record("thumbnail", ["window": entry.windowID ?? 0, "width": image.width, "height": image.height])
                 } else {
+                    self.unavailable.insert(entry.id)
                     Diagnostics.shared.record("thumbnailUnavailable", ["window": entry.windowID ?? 0])
                 }
             }
@@ -243,13 +259,17 @@ final class ThumbnailStore: ObservableObject {
 
     private func cacheImage(_ image: CGImage, for id: String) {
         let (bytes, overflow) = image.bytesPerRow.multipliedReportingOverflow(by: image.height)
-        guard !overflow, bytes <= policy.maxCachedBytes, policy.maxCachedImages > 0 else { return }
+        guard !overflow, bytes <= policy.maxCachedBytes else {
+            unavailable.insert(id)
+            return
+        }
+        requiredBytes[id] = bytes
+        let capacity = capacityAfterEviction
+        guard capacity.slots > 0, bytes <= capacity.bytes else { return }
         let visibleIDs = Set(visible.map(\.id))
         while cache.count >= policy.maxCachedImages || cachedBytes > policy.maxCachedBytes - bytes {
             guard let victim = cache.filter({ !visibleIDs.contains($0.key) }).min(by: { $0.value.access < $1.value.access })?.key else { return }
             cachedBytes -= cache.removeValue(forKey: victim)!.bytes
-            // 只有离屏图片会被淘汰；它重新可见时允许重拍，失败/超时项仍不重试。
-            attempted.remove(victim)
             // 已发布图片和待发布图片共用容量；及时释放已发布的离屏图片。
             if images[victim] != nil { images.removeValue(forKey: victim) }
         }
@@ -276,7 +296,8 @@ final class ThumbnailStore: ObservableObject {
         activeCapture = nil
         ready = false
         available = nil
-        attempted.removeAll()
+        unavailable.removeAll()
+        requiredBytes.removeAll()
         cache.removeAll()
         cachedBytes = 0
         access = 0
