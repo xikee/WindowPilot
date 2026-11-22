@@ -27,6 +27,13 @@ public enum WindowMatcher {
         return proposed.filter { claims[$0.value] == 1 }
     }
 
+    /// 本轮没有读取几何的旧条目不能参与匹配，也不能继承上一轮的截图编号。
+    public static func matchMeasured(_ windows: [(id: String, bounds: CGRect)], titlesThisScan: [String: String], candidates: [WindowMatchCandidate]) -> [String: UInt32] {
+        matchAll(windows.compactMap { window in
+            titlesThisScan[window.id].map { (window.id, window.bounds, $0) }
+        }, candidates: candidates)
+    }
+
     public static func match(bounds: CGRect, title: String, candidates: [WindowMatchCandidate]) -> UInt32? {
         guard bounds.width > 0, bounds.height > 0 else { return nil }
         let nearby = candidates.filter { candidate in
@@ -38,7 +45,9 @@ public enum WindowMatcher {
             return dx + dy + dw + dh < 8
         }
         let titled = title.isEmpty ? [] : nearby.filter { $0.title == title }
-        let matches = titled.isEmpty ? nearby : titled
-        return matches.count == 1 ? matches[0].id : nil
+        // 有真实标题且明确矛盾时，几何相同也不是同一窗口的可靠证据。
+        if !titled.isEmpty { return titled.count == 1 ? titled[0].id : nil }
+        guard nearby.count == 1, title.isEmpty || (nearby[0].title ?? "").isEmpty else { return nil }
+        return nearby[0].id
     }
 }

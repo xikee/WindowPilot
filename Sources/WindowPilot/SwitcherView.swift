@@ -58,7 +58,7 @@ struct SwitcherView: View {
                 Text(model.sameApp ? "当前应用" : "所有窗口").font(.system(size: 11)).foregroundStyle(Palette.secondary)
                 if model.isDemo { Text("交互演示").font(.system(size: 9, weight: .medium)).foregroundStyle(Palette.accent).padding(.horizontal, 7).padding(.vertical, 4).background(Palette.accent.opacity(0.1)).clipShape(Capsule()) }
                 Spacer()
-                Text("\(model.windows.count) 个窗口").font(.system(size: 11)).foregroundStyle(Palette.secondary)
+                Text(model.incomplete ? "\(model.windows.count) 个窗口 · 部分未响应" : "\(model.windows.count) 个窗口").font(.system(size: 11)).foregroundStyle(Palette.secondary)
                 Button { model.cancel?() } label: { Image(systemName: "xmark").font(.system(size: 11)).foregroundStyle(Palette.secondary).padding(5) }.buttonStyle(.plain).help("取消切换（Esc）")
             }.padding(.horizontal, 24).padding(.top, 22).padding(.bottom, 17)
             HStack(spacing: 9) {
@@ -71,8 +71,8 @@ struct SwitcherView: View {
                 Spacer(); ProgressView().controlSize(.small); Text("正在寻找窗口…").font(.system(size: 12)).foregroundStyle(Palette.secondary).padding(.top, 10); Spacer()
             } else if model.windows.isEmpty {
                 Spacer(); Image(systemName: "rectangle.on.rectangle.slash").font(.system(size: 30)).foregroundStyle(Palette.secondary)
-                Text(model.query.isEmpty ? "没有可切换的窗口" : "没有找到“\(model.query)”").font(.system(size: 13)).foregroundStyle(Palette.text).padding(.top, 10)
-                Text(model.query.isEmpty ? "打开一个应用窗口后再试试。" : "试试应用名称或窗口标题。 ").font(.system(size: 11)).foregroundStyle(Palette.secondary).padding(.top, 3); Spacer()
+                Text(model.incomplete ? "暂未找到可用窗口" : (model.query.isEmpty ? "没有可切换的窗口" : "没有找到“\(model.query)”")).font(.system(size: 13)).foregroundStyle(Palette.text).padding(.top, 10)
+                Text(model.incomplete ? "部分应用未响应，可稍后重新打开切换器。" : (model.query.isEmpty ? "打开一个应用窗口后再试试。" : "试试应用名称或窗口标题。")).font(.system(size: 11)).foregroundStyle(Palette.secondary).padding(.top, 3); Spacer()
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {

@@ -20,13 +20,25 @@ final class ActivationRequest {
 }
 
 enum WindowActivationResult: String {
-    case confirmed, unavailable, rejected, timedOut, superseded
+    case confirmed, unavailable, rejected, timedOut, superseded, invalidTarget
+}
+
+enum WindowRaiseResult {
+    case accepted, rejected, invalidTarget
+
+    init(_ error: AXError, onTargetWindow: Bool) {
+        switch error {
+        case .success: self = .accepted
+        case .invalidUIElement where onTargetWindow: self = .invalidTarget
+        default: self = .rejected
+        }
+    }
 }
 
 /// 回调统一回到主队列；系统调用由实现安排到后台，测试可以替换整个边界。
 protocol WindowActivationBackend {
     func prepare(_ window: WindowEntry) -> Bool
-    func raise(_ window: WindowEntry, request: ActivationRequest, completion: @escaping (Bool) -> Void)
+    func raise(_ window: WindowEntry, request: ActivationRequest, completion: @escaping (WindowRaiseResult) -> Void)
     func isFocused(_ window: WindowEntry, request: ActivationRequest, completion: @escaping (Bool) -> Void)
 }
 
@@ -39,26 +51,31 @@ final class AccessibilityActivationBackend: WindowActivationBackend {
         return app.isActive || app.activate(options: [])
     }
 
-    func raise(_ window: WindowEntry, request: ActivationRequest, completion: @escaping (Bool) -> Void) {
+    func raise(_ window: WindowEntry, request: ActivationRequest, completion: @escaping (WindowRaiseResult) -> Void) {
         queue.async {
-            guard !request.isCancelled, let element = window.element else { DispatchQueue.main.async { completion(false) }; return }
-            AXUIElementSetMessagingTimeout(element, 0.10)
-            var minimized: CFTypeRef?
-            let code = AXUIElementCopyAttributeValue(element, kAXMinimizedAttribute as CFString, &minimized)
-            if (code == .success ? minimized as? Bool : window.minimized) == true, !request.isCancelled {
-                AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-            }
-            guard !request.isCancelled else { DispatchQueue.main.async { completion(false) }; return }
-            let result = AXUIElementPerformAction(element, kAXRaiseAction as CFString)
-            var success = result == .success
-            if !success, !request.isCancelled {
-                let app = AXUIElementCreateApplication(window.pid)
-                AXUIElementSetMessagingTimeout(app, 0.10)
-                success = AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, element) == .success
-            }
-            let accepted = success
-            DispatchQueue.main.async { completion(accepted) }
+            guard !request.isCancelled, let element = window.element else { return }
+            let result = Self.raise(element, window: window, request: request)
+            DispatchQueue.main.async { completion(result) }
         }
+    }
+
+    private static func raise(_ element: AXUIElement, window: WindowEntry, request: ActivationRequest) -> WindowRaiseResult {
+        if AXUIElementSetMessagingTimeout(element, 0.10) == .invalidUIElement { return .invalidTarget }
+        var minimized: CFTypeRef?
+        let code = AXUIElementCopyAttributeValue(element, kAXMinimizedAttribute as CFString, &minimized)
+        if code == .invalidUIElement { return .invalidTarget }
+        if (code == .success ? minimized as? Bool : window.minimized) == true, !request.isCancelled {
+            let restore = AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+            if restore == .invalidUIElement { return .invalidTarget }
+        }
+        guard !request.isCancelled else { return .rejected }
+        let raise = WindowRaiseResult(AXUIElementPerformAction(element, kAXRaiseAction as CFString), onTargetWindow: true)
+        guard raise == .rejected, !request.isCancelled else { return raise }
+        let app = AXUIElementCreateApplication(window.pid)
+        AXUIElementSetMessagingTimeout(app, 0.10)
+        let fallback = AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, element)
+        // fallback 的接收者是应用；其失效不能单独证明目标窗口失效。
+        return WindowRaiseResult(fallback, onTargetWindow: false)
     }
 
     func isFocused(_ window: WindowEntry, request: ActivationRequest, completion: @escaping (Bool) -> Void) {
@@ -105,23 +122,34 @@ final class WindowActivator {
         pendingCompletion = completion
         let deadline = now() + timeout
         schedule(timeout) { [weak self] in self?.finish(request, .timedOut) }
-        guard backend.prepare(window) else { finish(request, .unavailable); return }
-        backend.raise(window, request: request) { [weak self] accepted in
-            guard let self, self.current === request else { return }
-            guard accepted else { self.finish(request, .rejected); return }
-            self.verify(window, request: request, deadline: deadline)
+        let prepared = backend.prepare(window)
+        guard isPending(request, before: deadline) else { return }
+        guard prepared else { finish(request, .unavailable); return }
+        backend.raise(window, request: request) { [weak self] result in
+            guard let self, self.isPending(request, before: deadline) else { return }
+            switch result {
+            case .invalidTarget: self.finish(request, .invalidTarget)
+            case .accepted, .rejected:
+                self.verify(window, request: request, deadline: deadline, retry: result == .accepted)
+            }
         }
     }
 
-    private func verify(_ window: WindowEntry, request: ActivationRequest, deadline: TimeInterval) {
-        guard current === request else { return }
-        guard now() < deadline else { finish(request, .timedOut); return }
+    private func verify(_ window: WindowEntry, request: ActivationRequest, deadline: TimeInterval, retry: Bool) {
+        guard isPending(request, before: deadline) else { return }
         backend.isFocused(window, request: request) { [weak self] focused in
-            guard let self, self.current === request else { return }
-            guard self.now() < deadline else { self.finish(request, .timedOut); return }
+            guard let self, self.isPending(request, before: deadline) else { return }
             if focused { self.finish(request, .confirmed) }
-            else { self.schedule(0.04) { [weak self] in self?.verify(window, request: request, deadline: deadline) } }
+            else if retry {
+                self.schedule(0.04) { [weak self] in self?.verify(window, request: request, deadline: deadline, retry: true) }
+            } else { self.finish(request, .rejected) }
         }
+    }
+
+    private func isPending(_ request: ActivationRequest, before deadline: TimeInterval) -> Bool {
+        guard current === request else { return false }
+        guard now() < deadline else { finish(request, .timedOut); return false }
+        return true
     }
 
     private func finish(_ request: ActivationRequest, _ result: WindowActivationResult) {
