@@ -8,6 +8,7 @@ final class SwitcherModel: ObservableObject {
     @Published var selectedID: String?
     @Published var query = ""
     @Published var loading = false
+    @Published var incomplete = false
     @Published var isDemo = false
     @Published var sameApp = false
     @Published var presentationID = UUID()
@@ -114,6 +115,7 @@ final class SwitcherController {
 
     private func begin(backward: Bool, sameApp: Bool, demo: Bool = false, pinned: Bool = false) {
         Diagnostics.shared.record("begin", ["backward": backward, "sameApp": sameApp, "demo": demo, "pinned": pinned])
+        service.cancelActivation()
         requestID = UUID()
         let token = requestID
         session.begin(backward: backward)
@@ -136,8 +138,10 @@ final class SwitcherController {
             self.allWindows = inventory.windows
             self.session.load(inventory.windows.map(\.id), currentID: pinned && !demo ? nil : inventory.focusedID)
             self.model.loading = false
+            self.model.incomplete = inventory.incomplete
             let focused = inventory.windows.first { $0.id == inventory.focusedID }
             Diagnostics.shared.record("inventory", ["count": inventory.windows.count, "cached": inventory.cached,
+                                                      "catalogAgeMS": inventory.catalogAgeMS,
                                                       "focusSource": inventory.focusSource, "focusedWindow": focused?.windowID ?? 0])
             self.updateSearch(self.model.query)
             if self.session.commitWhenReady { self.commit(); return }
@@ -173,22 +177,35 @@ final class SwitcherController {
 
     private func commit() {
         let id = session.release()
-        if session.isLoading { return }
+        if session.isLoading {
+            // 冷启动可能跨多轮扫描；松键后不能在数秒之后突然切走用户当前窗口。
+            let token = requestID
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self, self.requestID == token, self.session.commitWhenReady, self.session.isLoading else { return }
+                self.cancel()
+            }
+            return
+        }
         let window = allWindows.first { $0.id == id }
         let isDemo = model.isDemo
         Diagnostics.shared.record("commit", ["loading": session.isLoading, "hasTarget": window != nil, "demo": isDemo])
         cancel()
         guard !isDemo, let window else { return }
-        service.activate(window) { [weak self] success in
-            Diagnostics.shared.record("activation", ["success": success, "pid": window.pid, "window": window.windowID ?? 0,
+        service.activate(window) { [weak self] result in
+            Diagnostics.shared.record("activation", ["success": result == .confirmed, "reason": result.rawValue,
+                                                      "pid": window.pid, "window": window.windowID ?? 0,
                                                       "frontmostPID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0])
-            if !success { self?.preferences.statusMessage = "窗口已关闭或暂时无法切换，请重新打开切换器。" }
+            if result != .confirmed && result != .superseded {
+                self?.preferences.statusMessage = "未能确认目标窗口已置前，请重新打开切换器重试。"
+            }
         }
     }
 
     func cancel() {
         if session.isActive { Diagnostics.shared.record("cancel") }
         session.cancel()
+        service.cancelDiscovery()
+        model.incomplete = false
         hotkeys.endSession()
         requestID = UUID()
         if panel?.isVisible == true { panel?.orderOut(nil) }
