@@ -8,6 +8,7 @@ final class SwitcherModel: ObservableObject {
     @Published var selectedID: String?
     @Published var query = ""
     @Published var loading = false
+    @Published var incomplete = false
     @Published var isDemo = false
     @Published var sameApp = false
     @Published var presentationID = UUID()
@@ -137,6 +138,7 @@ final class SwitcherController {
             self.allWindows = inventory.windows
             self.session.load(inventory.windows.map(\.id), currentID: pinned && !demo ? nil : inventory.focusedID)
             self.model.loading = false
+            self.model.incomplete = inventory.incomplete
             let focused = inventory.windows.first { $0.id == inventory.focusedID }
             Diagnostics.shared.record("inventory", ["count": inventory.windows.count, "cached": inventory.cached,
                                                       "catalogAgeMS": inventory.catalogAgeMS,
@@ -175,7 +177,15 @@ final class SwitcherController {
 
     private func commit() {
         let id = session.release()
-        if session.isLoading { return }
+        if session.isLoading {
+            // 冷启动可能跨多轮扫描；松键后不能在数秒之后突然切走用户当前窗口。
+            let token = requestID
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self, self.requestID == token, self.session.commitWhenReady, self.session.isLoading else { return }
+                self.cancel()
+            }
+            return
+        }
         let window = allWindows.first { $0.id == id }
         let isDemo = model.isDemo
         Diagnostics.shared.record("commit", ["loading": session.isLoading, "hasTarget": window != nil, "demo": isDemo])
@@ -194,6 +204,8 @@ final class SwitcherController {
     func cancel() {
         if session.isActive { Diagnostics.shared.record("cancel") }
         session.cancel()
+        service.cancelDiscovery()
+        model.incomplete = false
         hotkeys.endSession()
         requestID = UUID()
         if panel?.isVisible == true { panel?.orderOut(nil) }
