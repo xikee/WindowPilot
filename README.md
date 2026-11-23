@@ -4,17 +4,17 @@
 
 ![瞬切窗口切换器，演示数据](docs/switcher.png)
 
-[下载 macOS Apple Silicon 预览版](https://github.com/xikee/WindowPilot/releases/tag/v1.0.0-preview.3) · [测试记录](docs/VALIDATION.md)
+[下载 macOS Apple Silicon 预览版](https://github.com/xikee/WindowPilot/releases/tag/v1.0.0-preview.4) · [测试记录](docs/VALIDATION.md)
 
 ## 打开应用
 
 从 Release 下载 ZIP，解压得到 `瞬切.app`。本地构建产物位于 `dist/瞬切.app`。应用常驻菜单栏，关闭设置窗口后仍然运行；从菜单栏选择「退出瞬切」结束。
 
-当前发布为 `v1.0.0-preview.3`（构建 6），要求 macOS 13+、Apple Silicon。本预览版使用本地临时签名，没有开发者公证；下载后如被 macOS 阻止，可能需要在系统「隐私与安全性」中允许打开。
+当前发布为 `v1.0.0-preview.4`（构建 8），要求 macOS 13+、Apple Silicon。本预览版使用本地临时签名，没有开发者公证；下载后如被 macOS 阻止，可能需要在系统「隐私与安全性」中允许打开。
 
-第三个预览版缩短了面板出现前的等待，修复了刚打开窗口时首次切换，以及按住 Option 连点 Tab 时高亮落后一格的问题。已在 macOS 14.8.9 实测「所有窗口」和「当前应用」两种快捷键，松开 Option 后会置前最后高亮的窗口。
+第四个预览版是可靠性修订：冷启动先扫描当前应用，未扫完显示加载，部分应用无响应时明确提示；只有本轮读取到位置的窗口才关联截图；系统拒绝置前后会核对实际焦点，明确失效的窗口立即移除；缩略图容量腾出后自动补拍。
 
-本地构建 8 是未发布的可靠性修订。本次测试包单独放在 `dist/构建-8/瞬切.app`，不替换之前的应用。构建 7 的架构选择与 craft-anything 分析见 [AltTab 评估记录](docs/ALTTAB-ASSESSMENT.md)。
+构建 7 的架构取舍与 craft-anything 分析见 [AltTab 评估记录](docs/ALTTAB-ASSESSMENT.md)；本地构建产物仍位于 `dist/瞬切.app`。
 
 第一次使用时，在「隐私与权限」中：
 
@@ -76,7 +76,7 @@ plutil -lint "dist/瞬切.app/Contents/Info.plist"
 
 自动检查覆盖快速松键、加载期间连续按键、异步返回时取消、正反向循环、空列表、单窗口、搜索恢复、中英文与重音搜索、2,430 组循环索引组合，以及窗口关联歧义和缓存有效期。激活与缩略图检查使用可替换后端和虚拟时钟，验证超时、取消、迟到结果、在途预算与缓存容量。界面检查使用真实 AppKit 窗口和本地 `NSEvent`；这些检查不替代授权后的跨应用端到端测试。
 
-构建 6 曾完成授权后的真实系统验证；本地构建 7 已通过自动检查与 AppKit 界面检查，尚未复测授权后的跨应用激活和真实截图，记录见 [VALIDATION.md](docs/VALIDATION.md)。需要排查问题时，可先退出当前实例，再显式开启本机诊断：
+构建 6 曾完成授权后的真实系统验证；构建 8 已通过自动检查与 AppKit 界面检查，尚未复测授权后的跨应用激活和真实截图，记录见 [VALIDATION.md](docs/VALIDATION.md)。需要排查问题时，可先退出当前实例，再显式开启本机诊断：
 
 ```bash
 WINDOWPILOT_LOG="$(pwd)/.build/live-check.jsonl"
@@ -103,7 +103,7 @@ open "dist/瞬切.app" --args --diagnostics "$WINDOWPILOT_LOG"
 - 使用系统公开 API。其他 Space 和全屏应用窗口是否可枚举取决于 macOS 与目标应用的辅助功能实现，不保证完整跨 Space 支持。
 - 不提供浏览器标签页、窗口平铺、关闭应用、自动更新或登录自启。
 - 受保护内容、部分最小化窗口或特殊应用可能没有可用截图；会显示应用图标与标题。
-- 不同应用对辅助功能的支持程度不同。历史构建已验证本机上的跨应用激活、最小化与隐藏应用恢复；构建 7 尚未重做这些系统验证，多显示器、其他 Space 和其他 macOS 版本也尚未专项验证。
+- 不同应用对辅助功能的支持程度不同。历史构建已验证本机上的跨应用激活、最小化与隐藏应用恢复；构建 8 尚未重做这些系统验证，多显示器、其他 Space 和其他 macOS 版本也尚未专项验证。
 - 已安装的其他窗口切换工具可能占用相同快捷键，可暂停其中一个或更换瞬切的主修饰键。
 
 交互参考：[AltTab](https://alt-tab.app/)。没有复制其源码或资源。
